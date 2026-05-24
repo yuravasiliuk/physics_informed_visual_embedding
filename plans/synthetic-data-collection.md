@@ -68,7 +68,7 @@ For each frame in each clip, log:
 | Contact reports | `ContactSensor` per dynamic body | Parquet, sparse rows per contact event |
 | Camera intrinsics + extrinsics | Replicator camera state | JSON per clip |
 
-Per-body state columns: `body_id, frame, mass, CoM_world (xyz), v_world (xyz), ω_world (xyz), pose_world (7-vec), distance_to_ground, kinematic_flag, bbox_diag, compact_flag` (the compact_flag implements the CoM filter from [training-data.md "Label semantics"](training-data.md#label-semantics)).
+Per-body state columns: `body_id, frame, mass, CoM_world (xyz), v_world (xyz), ω_world (xyz), pose_world (7-vec), kinematic_flag, bbox_diag, compact_flag` (the compact_flag implements the CoM filter from [training-data.md "Label semantics"](training-data.md#label-semantics)). Distance-to-ground is intentionally omitted from the supervision head set in this phase; if added later it can be derived offline from `pose_world` + the ground-plane geometry.
 
 Camera-frame conversion (CoM, v, ω → camera frame to match [training-data.md "Label semantics"](training-data.md#label-semantics)) happens *offline* at dataloader time so the raw log keeps world-frame state — cheaper to recompute than to re-render if the convention changes.
 
@@ -108,12 +108,16 @@ Plan for 10k free-object + 5k manipulation as the **workstation-feasible Phase-1
 
 1. **Smoke test, 1 clip.** One drop scene, Franka not yet loaded. Verify Replicator emits RGB/depth/normals/seg correctly, custom callback writes per-body Parquet, manifest entry created. Manual inspection of every output.
 2. **Sanity dashboard.** Streamlit / matplotlib script: depth histogram, normals unit-norm check, seg mask coverage, contact-event frequency per template, mass/CoM/ω distributions. Run on every batch of new clips.
-3. **Phase 1a — 100-clip pilot.** Five free-object templates, full DR on. Check dataloader can read WebDataset shards into training format. Train a 1-epoch B-config smoke run end-to-end.
-4. **Phase 1b — 1k clips.** Stratification correct? CoM filter (`compact_flag`) excluding the right bodies? Training loss curves sane?
-5. **Phase 1c — 10k clips free-object.** Full Phase-1 corpus. Train B and F to convergence; first real B-vs-F comparison.
-6. **Phase 2a — Franka pick-place smoke test.** 100 clips. Verify controller, contact reports under grasp, articulation state logging.
-7. **Phase 2b — 5k manipulation clips.** Three manipulation templates. Integrate into Phase-1 corpus.
-8. **Decision gate.** If F shows signal over B, push to cluster for 100k+ extension (see [training-data.md §Targets](training-data.md#targets-placeholder--revise-after-pilot)). If not, diagnose using [domain-marginalization-regularizer.md "Diagnostics"](domain-marginalization-regularizer.md#diagnostics--is-the-regularizer-actually-working).
+3. **Phase 0.5 — feasibility probe on free pre-rendered data. Hard gate.** Before any Isaac Sim compute is spent on Phase 1, prove the dynamics heads are *learnable* on perfect data. Train a small (≤ 30M-param) clip-level encoder + per-object dynamics heads on **Kubric MOVi-E** (or CLEVRER), 4-frame RGB inputs, ground-truth per-body ω / v / CoM targets.
+   - **Pass criteria, must all hold on held-out scenes:** per-axis ω R² > 0.5, v R² > 0.5, CoM L2 below half the median bbox diagonal.
+   - **If it fails:** the per-object dynamics formulation is not learnable on perfect data — full pipeline will not work either. Pivot to the R-config (real-only with pseudo-labels) and/or revise the head set before spending Isaac Sim cycles.
+   - Budget: ~1 GPU-day. This is the cheapest possible falsification of the project thesis.
+4. **Phase 1a — 100-clip pilot.** Five free-object templates, full DR on. Check dataloader can read WebDataset shards into training format. Train a 1-epoch B-config smoke run end-to-end.
+5. **Phase 1b — 1k clips.** Stratification correct? CoM filter (`compact_flag`) excluding the right bodies? Training loss curves sane?
+6. **Phase 1c — 10k clips free-object.** Full Phase-1 corpus. Train B and F to convergence; first real B-vs-F comparison.
+7. **Phase 2a — Franka pick-place smoke test.** 100 clips. Verify controller, contact reports under grasp, articulation state logging.
+8. **Phase 2b — 5k manipulation clips.** Three manipulation templates. Integrate into Phase-1 corpus.
+9. **Decision gate.** If F shows signal over B, push to cluster for 100k+ extension (see [training-data.md §Targets](training-data.md#targets-placeholder--revise-after-pilot)). If not, diagnose using [domain-marginalization-regularizer.md "Diagnostics"](domain-marginalization-regularizer.md#diagnostics--is-the-regularizer-actually-working).
 
 ## Open questions
 

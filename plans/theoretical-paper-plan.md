@@ -12,8 +12,23 @@
 - [V-JEPA 2](../summaries/v-jepa2.md) and the [intuitive-physics opinion paper](../summaries/opinion-intuitive-physics.md) — video at scale still fails [IntPhys 2](../summaries/intphys2.md) (96 % human vs 56 % best model).
 - [Cosmos-Transfer2.5](../summaries/cosmos-predict2.5.md) — Sim2Real-by-pixel-translation, the *competing paradigm* to latent alignment.
 
+## Why we expect to escape PI-JEPA's null result
+
+PI-JEPA is the closest negative empirical precedent: their ablation (Table 5 in the paper, summary in [pi-jepa.md](../summaries/pi-jepa.md)) reports the PDE-residual loss as **neutral** on top of operator splitting and VICReg. Any plan that pattern-matches to "physics loss bolted onto JEPA" inherits this null until argued otherwise. The argument follows.
+
+**Different signal class.** PI-JEPA's physics loss is a *residual* on a known operator: the encoder must produce a latent that, when decoded back to physical fields, satisfies a PDE up to autodiff'd residual. This is supervision on a *constraint*, not on an *observable*. Residual losses are easy to satisfy trivially when the residual operator has a large null space (any encoder mapping into the residual's kernel pays no cost). The brainstorm's heads are *direct regression onto observable physical quantities* (CoM in camera frame, ω in camera frame, contact force magnitudes per body). There is no null space — the target is a real number, the prediction is a real number, the loss is L2. The PI-JEPA failure mode does not transfer mechanically.
+
+**Closer empirical analogue: RoboScape.** RoboScape's keypoint-dynamics auxiliary head — a *direct regression* on per-keypoint motion derived from a pretrained perception model — is the right reference point, and it is **positive**: dropping it costs ~21 % on action-conditioning MSE ([roboscape.md](../summaries/roboscape.md) Table 2). Our heads sit in the same family (direct-regression on per-object physical state), so we should expect RoboScape's positive result to be the prior over PI-JEPA's null.
+
+**What this commits us to predicting.** If RoboScape is the right analogue, the F − B gap should come **from dynamics heads (CoM, ω, v, contact), not from depth / normals / seg** — RoboScape's own ablation found depth nearly flat next to dynamics. Translating to our F-vs-B design ([training-data.md](training-data.md#experimental-configurations-baseline-vs-full)):
+- Geometric heads stabilize the encoder but should not drive F > B by themselves.
+- Per-head leave-one-out on F (the "F − one head" ablation) should show one or two dynamics heads carrying the gain; if every head matters equally, the result is suspect.
+- If F ≈ B *and* the per-object dynamics linear probe (the Phase 0.5 diagnostic) is near-chance on held-out scenes, we are in PI-JEPA's regime, not RoboScape's — the head set is too weak to differentiate the encoder. Pivot.
+
+**Honest fallback.** PI-JEPA's authors recovered their gains via *operator splitting* (architecture) and *VICReg* (collapse prevention), not the physics loss. The architectural analogue here is the multi-head split itself (one head per physical quantity, no shared trunk after fusion) — which we already do. The collapse-prevention analogue is the domain-marginalization regularizer, which we also do but for a different reason. If the dynamics heads contribute nothing, the project's residual value is exactly these two architectural pieces, framed honestly as "what survives the null."
+
 ## Gaps we can theoretically close (beyond "physics as prediction head")
-The initial brainstorm idea is: add sim-only heads (CoM, ω, contact, ground-distance) on top of sim+real heads (normals, segmentation, depth). What the existing theory does *not* cover, and what we can add:
+The initial brainstorm idea is: add sim-only heads (CoM, ω, v, contact) on top of sim+real heads (normals, segmentation, depth). What the existing theory does *not* cover, and what we can add:
 
 ### 1. Multi-head equivalence composition
 Current theory ([Why-Aux-JEPA](../summaries/why-auxiliary-tasks-jepa.md)) handles **one** auxiliary head: each head induces a partition of the input space (equivalence classes of "same-label" inputs). With *K* simultaneous heads the encoder is constrained to the **meet** of those partitions. Open:

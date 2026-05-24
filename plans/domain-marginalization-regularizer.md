@@ -4,11 +4,13 @@
 
 ## Why this exists
 
-The encoder is trained with **asymmetric supervision**: depth/normals/segmentation have labels on both sim and real, but CoM / ω / v / contact force / distance-to-ground have labels only on sim (and translated sim). Naive masked-loss training in this setting has a well-defined failure mode:
+This regularizer is the **central sim→real bridging mechanism** of the project, not an auxiliary safeguard. The deliverable is a domain-agnostic encoder so that policies trained on `φ(X_sim)` deploy on real frames without finetuning. That works only if `φ(X) | D=sim` and `φ(X) | D=real` are aligned in distribution — which does not happen by default. This document specifies the forcing function that makes it happen.
 
-> The encoder learns a *sim-vs-real* detector — trivially available from pixel statistics (lighting, texture, shadow softness, sensor noise) — and routes the sim-only heads through that subspace. The real branch never receives gradient on physics heads, so physics features never need to be encoded for real inputs. At inference on real frames, the physics-aware embedding is effectively untrained.
+The encoder is also trained with **asymmetric supervision**: depth/normals/segmentation have labels on both sim and real, but CoM / ω / v / contact force have labels only on sim (and translated sim). Naive masked-loss training in this setting has a well-defined failure mode that compounds the domain-gap problem:
 
-The analogy with multi-dataset multi-task training (face-bbox + landmarks) holds only if the two data sources are **visually indistinguishable**. They are not, here. The regularizer is the forcing function that makes them effectively so.
+> The encoder learns a *sim-vs-real* detector — trivially available from pixel statistics (lighting, texture, shadow softness, sensor noise) — and routes the sim-only heads through that subspace. The real branch never receives gradient on physics heads, so physics features never need to be encoded for real inputs. At inference on real frames, the physics-aware embedding is effectively untrained, and downstream sim-trained policies break.
+
+The regularizer therefore serves two ends at once: (a) it aligns the two domain marginals so downstream policies generalize, (b) it forbids the sim-only physics heads from carving out a sim-only feature subspace they cannot generalize from.
 
 ## What the regularizer must achieve
 
@@ -59,7 +61,7 @@ A + C is the cheap, defensible default. D is the version that earns the paper it
 - **Batch composition.** 50/50 sim/real per step, with the sim half further split sim-raw / sim-translated. Real includes translated-pair index when available.
 - **Losses.**
   - Symmetric heads (depth, normals, seg): unweighted, both domains.
-  - Sim-only heads (CoM, ω, v, contact force, dist-to-ground): unweighted on sim, ignore-masked on real (see [training-data.md "Label semantics"](training-data.md#label-semantics)).
+  - Sim-only heads (CoM, ω, v, contact force): unweighted on sim, ignore-masked on real (see [training-data.md "Label semantics"](training-data.md#label-semantics)).
   - **Regularizer term:** `λ_dom · L_dom`, where `L_dom` is DANN+CORAL (A+B) for the first pass, with C added once translated pairs are available.
 - **`λ_dom` schedule.** Warm up linearly over the first ~5% of steps from 0 → target. Adversarial term is unstable at random init; ramping avoids early collapse.
 - **Target `λ_dom`.** Start at the value that drives the DANN classifier accuracy from ~1.0 (trivially separable) down to ~0.55–0.65. Below 0.55 the encoder is over-aligning and likely throwing away useful structure; above 0.7 the regularizer is too weak.
@@ -86,6 +88,8 @@ Track these every N steps; cheap, all of them:
 
 ## Connection to the rest of the plan
 
-- The regularizer is the load-bearing assumption behind config **F** in [training-data.md](training-data.md#experimental-configurations-baseline-vs-full). Without it, F is expected to underperform B.
+- The regularizer is the **load-bearing sim→real bridging mechanism** for the whole project, not just config F. Even config B benefits: without the regularizer, B's encoder is free to specialize on sim or real pixel statistics, and a policy trained on `φ(X_sim)` will not deploy on real frames. Run the regularizer on both configs.
+- The regularizer is *additionally* the load-bearing assumption behind config **F** in [training-data.md](training-data.md#experimental-configurations-baseline-vs-full). Without it, F is expected to underperform B because the sim-only heads carve out a sim-only feature subspace.
 - The transfer bound (Thm 2 in [theoretical-paper-plan.md](theoretical-paper-plan.md)) is what gives the regularizer formal justification; this file is the engineering side of that theorem.
 - The diagnostics above feed the B-vs-F decision rule: if F (with regularizer) ≤ B, either the regularizer failed or the shortcut wasn't really happening — both are publishable results.
+- **Downstream policy deployment** is the ultimate eval: train a small sim-only policy on `φ(X_sim)` for a controlled task (e.g. RoboCasa pick-place), deploy on real frames, measure success rate. Domain classifier accuracy on `φ(X)` is a *proxy* — policy transfer is the truth.
