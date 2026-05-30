@@ -19,7 +19,15 @@ The original sketch is in [Physics informed embedding.pdf](Physics%20informed%20
 > **sim+real heads:** depth, normals, segmentation.
 > **sim-only heads:** center of mass, angular velocity ω, linear velocity v, contact force.
 
-Two refinements to the sketch the plans commit to:
+**Current main line has moved off this sketch.** The raw-pixel learned conv branch
+is the most sim→real-fragile component, so it is demoted to an *escape hatch*; the
+default is now a **frozen encoder + a multi-layer nonlinear head over its features**
+(trainable parameters never touch raw pixels). The full argument and the capacity
+ladder that decides when the conv branch is *earned* are in
+[BRAINSTORM.md §2](plans/BRAINSTORM.md#2-architecture). The supervision-head split
+below is unchanged.
+
+Two refinements to the sketch the plans commit to (orthogonal to the backbone choice):
 - The encoder is **clip-level**, K = 4–16 frames. ω, v, and time-derivatives of CoM
   are not observable from a single frame, so single-frame inputs are off the table.
   See [training-data.md §Architecture — temporal modeling](plans/training-data.md#architecture--temporal-modeling).
@@ -40,8 +48,8 @@ For depth on any topic, follow the links into [plans/](plans/) and [summaries/](
 | [Physics informed embedding.pdf](Physics%20informed%20embedding.pdf) | The original architecture sketch. |
 | [papers/](papers/) | PDFs of the literature we read while scoping the project. |
 | [summaries/](summaries/) | Per-paper working notes + the cross-paper index in [summaries/README.md](summaries/README.md). |
-| [plans/](plans/) | Design docs. Read in this order: [theoretical-paper-plan.md](plans/theoretical-paper-plan.md) → [training-data.md](plans/training-data.md) → [domain-marginalization-regularizer.md](plans/domain-marginalization-regularizer.md) → [synthetic-data-collection.md](plans/synthetic-data-collection.md). |
-| [src/data_gen/](src/data_gen/) | Isaac Sim data-collection code. Entry point: [collect_clip.py](src/data_gen/collect_clip.py) (refactor of the original smoke script into reusable pieces; see [plans/probe-dataset.md](plans/probe-dataset.md)). |
+| [plans/](plans/) | Design docs, two lineages. **Committed plan (read in order):** [theoretical-paper-plan.md](plans/theoretical-paper-plan.md) → [training-data.md](plans/training-data.md) → [domain-marginalization-regularizer.md](plans/domain-marginalization-regularizer.md) → [synthetic-data-collection.md](plans/synthetic-data-collection.md); dataset spec stack [probe-dataset.md](plans/probe-dataset.md) → [scene-diversification.md](plans/scene-diversification.md) → [isaac-asset-diversification.md](plans/isaac-asset-diversification.md). **Active brainstorm hub:** [BRAINSTORM.md](plans/BRAINSTORM.md) (its §0 maps the rest of that cluster). **Critiques:** [critque.md](plans/critque.md) → [critique2.md](plans/critique2.md), [data_gen_critique0.md](plans/data_gen_critique0.md). |
+| [src/data_gen/](src/data_gen/) | Isaac Sim data-collection code (the only code so far). Entry point: [collect_clip.py](src/data_gen/collect_clip.py) (refactor of the original smoke script into reusable pieces; see [plans/probe-dataset.md](plans/probe-dataset.md)). Encoder / training / experiment code is **planned, not yet written** — see §Baseline to implement. |
 | [notebooks/](notebooks/) | Scratch / exploratory notebooks. |
 
 ---
@@ -51,10 +59,13 @@ For depth on any topic, follow the links into [plans/](plans/) and [summaries/](
 The full notes are in [summaries/README.md](summaries/README.md); the load-bearing
 take-aways for our design are:
 
-- **Architecture.** [SCOPE](summaries/scope.md) is the closest baseline: frozen DINOv2
-  cross-attended into a learned conv branch on RGB + normals beats concatenation-style
-  fusion (e.g. DiffusionNOCS) on out-of-distribution objects (ADD-S 59→76 on YCB-V).
-  This validates the fusion block in our sketch — **cross-attention, not concat**.
+- **Architecture.** [SCOPE](summaries/scope.md) — frozen DINOv2 cross-attended into a
+  learned conv branch on RGB + normals beats concatenation-style fusion (e.g.
+  DiffusionNOCS) on out-of-distribution objects (ADD-S 59→76 on YCB-V). Note this is
+  precedent for the **escape-hatch** two-stream (Rung 2), not the frozen-first main
+  line — and *if* the conv branch is entered, it says use **cross-attention, not
+  concat**. It does not bear on whether the conv branch is needed at all; that is the
+  layer-wise-probe question ([BRAINSTORM.md §2](plans/BRAINSTORM.md#2-architecture)).
 - **Aux-task supervision is principled, not arbitrary.**
   [Why and How Auxiliary Tasks Improve JEPA](summaries/why-auxiliary-tasks-jepa.md)
   shows each aux head induces an equivalence relation on the latent space; the encoder
@@ -92,6 +103,14 @@ take-aways for our design are:
 
 Pulled from the design docs; cite the source whenever you change one of these.
 
+> **Architecture note.** The main line is **frozen-first**: a frozen encoder + a
+> multi-layer nonlinear head over its features, *no* raw-pixel conv backbone. The
+> two-stream + cross-attention is an escape hatch, earned only if a layer-wise probe
+> finds no recoverable physics signal in the frozen encoder at any depth — see the
+> capacity ladder in [BRAINSTORM.md §2](plans/BRAINSTORM.md#2-architecture). The
+> **B/F configs below are about head sets** (B = dense only; F = + physics), which is
+> orthogonal to the backbone choice and unchanged.
+
 ### Theoretical scope ([plans/theoretical-paper-plan.md](plans/theoretical-paper-plan.md))
 - The first paper is **theory-only**. No experiments needed to ship it.
 - The distinctive contributions, in priority order: (1) domain-marginalization regularizer
@@ -105,8 +124,12 @@ Pulled from the design docs; cite the source whenever you change one of these.
 - **Real-data starting mix:** AgiBot-World-Beta (manipulation, mirrors RoboScape/Cosmos)
   + ScanNet++ (sensor-grade depth & normals).
 - **Simulator:** Isaac Lab. Matches Cosmos and IntPhys 2 stacks; full label coverage.
-- **Clip-level inputs**, K = 4–16 frames. V-JEPA 2 (temporal) for the frozen branch.
+- **Clip-level inputs**, K = 4–16 frames. V-JEPA 2 (temporal) for the frozen encoder.
   DINOv2 only as a single-frame geometry-only ablation.
+- **Frozen-first head** (main line): multi-layer nonlinear head over V-JEPA 2's
+  intermediate features; no raw-pixel conv backbone unless the layer-wise probe
+  earns it. See [training-data.md §Architecture](plans/training-data.md#architecture--temporal-modeling)
+  and [BRAINSTORM.md §2](plans/BRAINSTORM.md#2-architecture).
 - **All labels in camera frame.** Dense heads (depth, normals, seg) are per-pixel
   with an *ignore mask* for background. Dynamics heads (CoM, ω, v, contact) are
   **per-object** — masked-pool over predicted segmentation, then MLP.
@@ -114,8 +137,9 @@ Pulled from the design docs; cite the source whenever you change one of these.
   architectural (high mass / kinematic). Other heads are unaffected.
 - **Contact-force loss** gets a γ-multiplier on contacting bodies (cf. RoboScape γ = 5),
   otherwise the head collapses to "predict zero everywhere."
-- **Two configs trained on the same corpus**, both running the
-  domain-marginalization regularizer (it's the sim→real bridge, not an F-only safeguard):
+- **Two configs trained on the same corpus** (a *head-set* distinction — orthogonal
+  to the frozen-first backbone choice above), both running the domain-marginalization
+  regularizer (it's the sim→real bridge, not an F-only safeguard):
   - **B (baseline):** depth + normals + segmentation only. Symmetric heads only.
   - **F (full):** B + CoM, ω, v, contact. Sim-only heads add the asymmetric
     supervision the regularizer is also designed to defend against.
@@ -172,20 +196,32 @@ Concretely:
      `state.json`, `meta.json`, optional `seg_id_to_prim.json`) look sane.
    - **Step 2.** Sanity dashboard (depth histogram, normals unit-norm check, seg
      coverage, state distributions).
-   - **Step 3 (Phase 0.5, hard gate).** Feasibility probe on Kubric MOVi-E or CLEVRER:
-     small clip-level encoder + per-object dynamics heads on 4-frame RGB, ground-truth
-     ω / v / CoM targets. Required to pass: ω R² > 0.5, v R² > 0.5, CoM L2 < ½ median
-     bbox diagonal on held-out scenes. **No Isaac Sim compute is committed until this
-     passes** — if a small model can't learn dynamics on perfect data, the full
-     pipeline won't either. ~1 GPU-day.
+   - **Step 3 (Phase 0.5, hard gate).** Two probes on Kubric MOVi-E or CLEVRER
+     (shared GT ω / v / CoM, 4-frame RGB):
+     - **(a) Feasibility probe** — small clip-level encoder + per-object dynamics
+       heads. Answers *is dynamics learnable from perfect RGB at all?* Required to
+       pass: ω R² > 0.5, v R² > 0.5, CoM L2 < ½ median bbox diagonal on held-out
+       scenes.
+     - **(b) Layer-wise frozen probe (Rung 0)** — linear probe of **frozen V-JEPA 2
+       at each intermediate block** (compare DINO / SigLIP) for the same targets.
+       Answers *is the signal in the frozen encoder, and at which depth?* This is the
+       **architecture gate**: signal present → frozen-first main line, and its peak
+       depth sets which blocks the Step-2 head taps; signal absent at every depth →
+       the escape-hatch conv branch is justified.
+
+     **No Isaac Sim compute is committed until (a) passes** — if a small model can't
+     learn dynamics on perfect data, the full pipeline won't either. ~1 GPU-day.
    - **Step 4 (Phase 1a).** 100-clip pilot across the five free-object templates with
      full DR on. Validate the dataloader can read WebDataset shards.
-2. **Encoder & heads — B config first.**
+2. **Encoder & heads — B config first, frozen-first backbone.**
    - Clip-level inputs (K = 4 initially, K = 8 or 16 at Phase 1c).
-   - Frozen branch: V-JEPA 2 (temporal). DINOv2 disqualified for clip-level use except
+   - Frozen encoder: V-JEPA 2 (temporal). DINOv2 disqualified for clip-level use except
      as a single-frame ablation.
-   - Learned branch: (2+1)D or 3D conv U-Net on the K-frame stack.
-   - Fusion: cross-attention, queries from learned branch, K/V from V-JEPA 2 tokens.
+   - **Main-line head:** multi-layer nonlinear head over V-JEPA 2's *intermediate*
+     features (fuse several blocks, attentive-pool / shallow). **No raw-pixel conv
+     backbone** — that is the escape hatch (Rung 2), built only if the layer-wise
+     probe in Step 3 finds no recoverable physics signal at any depth. See
+     [BRAINSTORM.md §2](plans/BRAINSTORM.md#2-architecture).
    - Heads: dense per-pixel depth, normals, instance segmentation. No dynamics heads
      in B (those come with F, and are per-object).
    - All labels in camera frame, ignore-masked background, per [training-data.md "Label semantics"](plans/training-data.md#label-semantics).

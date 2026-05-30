@@ -4,14 +4,52 @@
 architecture sketched in `Physics informed embedding.pdf`, the physics-label
 targets, a probabilistic CoM formulation, and the sim→real strategy.*
 
-The architecture in one line: **a frozen semantic encoder (JEPA/DINO/SigLIP) +
-a trainable convolutional geometry encoder, fused by cross-attention, with
-prediction heads split by supervision availability.** RGB-only input, real or
-sim. Heads: *sim+real* (depth, normals, segmentation) and *sim-only* (angular
-velocity, center of mass, contact forces, distance-to-ground).
+The architecture in one line: **a frozen encoder (V-JEPA/DINO/SigLIP) + a
+multi-layer nonlinear head over its features**, with prediction heads split by
+supervision availability. RGB-only input, real or sim. Heads: *sim+real* (depth,
+normals, segmentation) and *sim-only* (angular velocity, center of mass, contact
+forces, distance-to-ground). The PDF's raw-pixel two-stream + cross-attention is
+demoted to an escape hatch (§2.3); the main line keeps the trainable parameters
+off raw pixels so sim→real stability holds by construction. See §2.
 
 Risks are listed first deliberately — most of them are load-bearing and several
 can silently invalidate results.
+
+---
+
+## 0. Document map
+
+This is the **hub for the active architecture/risks thinking**. For the
+whole-repo map (code, data pipeline, literature, the engineering milestone) start
+at the [root README](../README.md) — this doc does not duplicate it.
+
+**This brainstorm cluster:**
+- **BRAINSTORM.md** (this file) — architecture, risks (R1–R11), CoM formulation,
+  sim→real strategy, verifiability, open decisions.
+- [observability-weighted-loss.md](observability-weighted-loss.md) — spun off from
+  **R6 / §4**: weight physics loss by angular displacement + contact (not linear
+  velocity); learned heteroscedastic σ.
+- [physics-latent-ladder.md](physics-latent-ladder.md) — sibling "pragmatic
+  ladder" brainstorm; pre-experiment staging of physics-latent-dynamics targets.
+
+**Critiques that feed the risks here:**
+- [data_gen_critique0.md](data_gen_critique0.md) → its
+  [analysis](data_gen_critique0_analysis.md) — the data-gen review driving the
+  recent `collect_clip.py` work; source of **R11** (verification gaps).
+- [critque.md](critque.md) → [critique2.md](critique2.md) — earlier
+  proposal critiques (the single-frame-input fatal-flaw thread).
+
+**Relationship to the committed plan (⚠ open tension):** the
+[root README §Best tactics](../README.md#best-tactics--decisions-were-committing-to)
+and its Era-1 lineage ([theoretical-paper-plan.md](theoretical-paper-plan.md),
+[training-data.md](training-data.md), [probe-dataset.md](probe-dataset.md))
+**commit** to the two-stream design (frozen + learned conv branch, cross-attention,
+B/F configs) as decided. §2 of this doc **supersedes that for the main line**: the
+default is now a frozen encoder + multi-layer nonlinear head (no raw-pixel
+backbone), and the two-stream is demoted to an escape hatch entered only if a
+layer-wise probe finds no physics signal in the frozen encoder at any depth (R1
+warns the conv branch can otherwise make the frozen stream vestigial). Not yet
+reconciled into the README's §Best tactics; treat §2 as the newer position.
 
 ---
 
@@ -63,7 +101,11 @@ observable only through *dynamics* (off-center tumbling) and especially
 *contact* (tipping, bouncing, settling). If the dataset lacks dynamic/contact
 richness, these become targets with exact labels and no recoverable signal — the
 worst kind of confound. Target learnability must be designed into the *scenarios*,
-not just the labels.
+not just the labels. Partial mitigation (training-noise half only) via
+observability-weighted loss — see
+[observability-weighted-loss.md](observability-weighted-loss.md): weight by
+angular displacement + contact (not linear velocity), preferably as a learned
+heteroscedastic σ.
 
 ### R7 — Absolute-CoM is a confounded metric
 A head predicting absolute CoM scores high R² for free just by localizing the
@@ -102,34 +144,109 @@ ground truth).
 
 ## 2. Architecture
 
-Two parallel streams off the same RGB (image or video, real or sim):
+**Main line: a frozen encoder + a multi-layer, nonlinear head over its
+features.** No raw-pixel second backbone. The trainable parameters never see raw
+pixels — only frozen, domain-robust features — so sim→real stability is high *by
+construction*. The raw-pixel two-stream + cross-attention from the PDF is demoted
+to an escape hatch (§2.3), entered only if the gating experiment (§2.2, Rung 0)
+shows the physics signal is absent from the frozen encoder at every depth.
 
-1. **Frozen semantic stream** — JEPA / DINO / SigLIP, weights frozen → semantic
-   patches. Generalist, domain-robust, never trained.
-2. **Trainable geometry stream** — convolutional geometry encoder → geometric
-   patches. Learned from pixels.
+The reframe that matters: **V-JEPA is the thing being probed for physics.** The
+question is *"does a frozen generalist encoder encode physics that a head can
+recover — and transfer?"* not *"can a sim-trained conv net predict physics with
+SSL features as a side input?"* The second framing silently swaps the scientific
+question for an engineering one and reintroduces the sim-overfit branch.
 
-**Cross-attention** fuses them; prediction heads hang off the fused
-representation ("embedding over embedding").
+### 2.1 Why frozen-features-first is the stable choice (and its honest cost)
 
-The reframe that matters: **V-JEPA is not the thing being probed for physics.**
-It is a frozen semantic / domain prior. The geometry branch does the geometric
-heavy lifting from pixels. So the question is not "does V-JEPA encode CoM" but
-**"does a frozen generalist semantic stream help a trainable geometry encoder
-predict — and transfer — physics it couldn't get from geometry alone?"**
+The only reason to freeze the encoder is domain robustness. A head whose inputs
+are frozen features inherits that robustness — almost nothing can overfit sim
+appearance, because the overfittable low-level signal (texture, lighting) never
+reaches a trainable parameter. A raw-pixel conv branch is the opposite: trained on
+**sim physics labels only** (no real CoM/ω label exists), it *will* specialize to
+sim, and any fusion is the single fragile thing pulling it back toward real. That
+is R1 + R2, failing silently.
 
-Per-stream domain sensitivity (why the design is shaped this way):
-- the frozen semantic encoder already generalizes sim→real for *semantics*;
-- the trainable geometry conv **will** overfit sim appearance — so the domain-gap
-  work (Section 5) exists primarily to regularize *this* branch.
+The information-vs-gap trade-off, stated plainly:
+- **Raw pixels** — maximum information (nothing discarded), maximum domain gap.
+- **Frozen features** — minimum domain gap, but information bottlenecked to *what
+  the encoder chose to keep*.
 
-Open architecture questions:
-- **Temporal handling.** ω / contact are dynamic → either the geometry conv is
-  3D/temporal, or it is per-frame and the cross-attention/heads integrate time.
-  Decide explicitly.
-- **Cross-attention direction.** Geometry-as-query (semantics modulates geometry)
-  vs. the reverse. Geometry-as-query is the natural default for
-  physics-from-geometry-with-semantic-priors, but be deliberate.
+So a head over frozen features **cannot recover geometry the encoder discarded** —
+that information is gone. Its "cost" is therefore a feature: if it fails, it fails
+*honestly* ("the physics isn't recoverable from the embedding"), which is exactly
+the question we want answered. The bet is that the encoder **encodes but does not
+linearly expose** the physics — recoverable nonlinearly, and especially from
+*intermediate* layers (early/mid blocks retain spatial/geometric detail the final
+embedding has abstracted away). That bet is testable and cheap (§2.2, Rung 0).
+
+### 2.2 The capacity ladder (each rung adds capacity, subtracts stability)
+
+- **Rung 0 (gating experiment) — layer-wise linear probe.** Frozen encoder +
+  linear probe per target, **probed at each intermediate block**. Max stability,
+  cheapest, and it answers two things at once: *is the physics signal present at
+  all*, and *at which depth does it peak* (→ which layer the Rung-1 head should
+  tap). Run across encoders (**V-JEPA vs DINO vs SigLIP**); V-JEPA is
+  video/motion-trained, so it is the one plausibly carrying ω-relevant dynamics.
+  IntPhys 2 (V-JEPA 2 ~56–58% on intuitive physics) is a yellow flag that the
+  signal may be weak — which is precisely why this probe runs *before* anything is
+  built. **No second-stream work is committed until this locates a signal.**
+- **Rung 1 (main line) — multi-layer nonlinear head over frozen features.** Fuse
+  several intermediate blocks (à la DPT / DINO dense probes) into an
+  attentive-pool / shallow-conv / MLP head; DPT-style decoder for the dense heads.
+  This is a strict **superset of Rung 0's reach** (multiple layers, nonlinear)
+  while keeping Rung 0's domain robustness — it recovers nonlinearly-encoded and
+  early-layer geometry the final embedding lost, *without ever touching raw
+  pixels*. Most achievable accuracy-with-stability lives here. **This is where the
+  "use intermediate V-JEPA features instead of pixels" idea lands** — correctly
+  understood, it is not a second stream, it is the frozen-encoder probe done
+  properly.
+- **Rung 2 (escape hatch, §2.3) — raw-pixel trainable branch + cross-attention.**
+- **Rung 3 — LoRA / partial unfreeze.** Last resort: directly spends the domain
+  robustness the freeze was buying.
+
+**Job split** the ladder respects: *Job A — dense decoding capacity*
+(depth/normals/seg) is a head problem (Rung 1 DPT decoder), never a reason for a
+backbone. *Job B — supplying information the encoder lacks* (the physics) is the
+**only** thing that could justify Rung 2, and only after Rung 1 is shown to hit a
+ceiling on a signal Rung 0 confirmed exists.
+
+Caveat that survives every rung: **R2** — no architecture earns a real-domain
+physics label. Frozen-first doesn't fix R2; it avoids *also* paying the R1
+sim-overfit tax while that quantity is unmeasurable anyway.
+
+### 2.3 Alternative / escape hatch: the raw-pixel two-stream (the PDF design)
+
+Two parallel streams off the same RGB: a frozen semantic stream (JEPA/DINO/SigLIP)
+and a **trainable convolutional geometry stream from raw pixels**, fused by
+**cross-attention**, heads on the fused representation ("embedding over
+embedding"). Here V-JEPA is reframed as a frozen domain prior and the conv branch
+does the geometric heavy lifting from pixels.
+
+This is the PDF's design and the highest-capacity option — and the most
+transfer-fragile. It is the **only** path that can recover physics signal the
+frozen encoder discarded (it sees full-information pixels), so it is the right
+fallback *if and only if* Rung 0 shows the signal is **absent from the frozen
+encoder at every depth**. Conditions on entering it:
+- Rung 0 found no recoverable signal anywhere in the frozen features, **and** Rung
+  1 confirmed the ceiling is the information bottleneck, not head capacity;
+- **R1's load-bearing ablation is enforced and measured on the *real* side** (not
+  sim) — prove the frozen stream is doing work, or the domain bridge is gone;
+- the domain-gap work (Section 5) is aimed primarily at regularizing *this* branch.
+
+Note: feeding V-JEPA features (not pixels) into this "second stream" does **not**
+make it a safer Rung 2 — it collapses back into Rung 1 (a head over frozen
+features), because both streams then derive from the same bottlenecked source.
+Rung 2's only justification is full-information pixels; take that away and there
+is no second stream.
+
+### Open architecture questions
+- **Temporal handling.** ω / contact are dynamic. At the main line (Rungs 0–1)
+  this is "frozen *video* encoder (V-JEPA, native temporal) vs. per-frame image
+  encoder + a temporal head over the per-frame features." Decide explicitly.
+- **Cross-attention direction** (only relevant if the §2.3 escape hatch is
+  entered). Geometry-as-query (semantics modulates geometry) vs. the reverse;
+  geometry-as-query is the natural default, but be deliberate.
 
 ---
 
@@ -226,6 +343,10 @@ verify dynamics fidelity or learnability.
 
 ## 7. Open decisions
 
+- **Capacity ladder (gating decision, §2).** Start frozen-and-shallow (Rung 0/1)
+  and let measured ceilings — not the PDF — decide whether the trainable geometry
+  backbone (Rung 2) is earned. Begins with the frozen-encoder comparison
+  (V-JEPA vs DINO vs SigLIP), which is cheap and answers the core premise.
 - Probe formulation: **state read-out** (regress current ω/CoM) vs. **future
   prediction** (forecast next frames). Read-out is better-posed for "does it
   encode physics" (exact, interpretable labels); forecasting re-does V-JEPA's

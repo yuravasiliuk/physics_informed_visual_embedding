@@ -28,10 +28,20 @@ The architecture from [../Physics informed embedding.pdf](../Physics%20informed%
 
 The encoder operates on **K-frame clips**, not single frames. ω, v, and the time-derivative of CoM are not observable from a single image; the architecture must reflect that.
 
+> **Main line is frozen-first.** The default is a **frozen encoder + a multi-layer
+> nonlinear head over its features** (no raw-pixel trainable backbone) — trainable
+> parameters never see raw pixels, so sim→real stability holds by construction. The
+> raw-pixel conv branch + cross-attention below is an **escape hatch**, entered only
+> if a layer-wise probe finds no recoverable physics signal in the frozen encoder at
+> any depth. See [BRAINSTORM.md §2](BRAINSTORM.md#2-architecture). The **B/F split
+> is orthogonal to this** — it selects *head sets* (B = dense only; F = + physics),
+> not the backbone, and survives either choice.
+
 - **K = 4** for the Phase-0.5 feasibility probe and Phase 1a/1b. **K = 8 or 16** for Phase 1c onward (matches Isaac Sim clip length).
-- **Frozen branch.** Use V-JEPA 2 with its native temporal tokens. DINOv2 is single-frame and is **not eligible** for the F config; it remains a candidate only for a geometry-only B-config ablation, with frames encoded independently.
-- **Learned branch.** (2+1)D conv U-Net or 3D-conv U-Net on the K-frame stack. Factorized over (space, time) keeps parameters manageable.
-- **Fusion.** Cross-attention with queries from learned-branch tokens and K/V from V-JEPA 2's spatiotemporal tokens.
+- **Frozen encoder.** Use V-JEPA 2 with its native temporal tokens. DINOv2 is single-frame and is **not eligible** for the F config (no motion in a single frame); it remains a candidate only for a geometry-only B-config ablation, with frames encoded independently.
+- **Main-line head (frozen-first).** Fuse several **intermediate** V-JEPA 2 blocks (à la DPT / DINO dense probes) into an attentive-pool / shallow head; the layer-wise linear probe (Rung 0) locates which depth carries the dynamics signal and gates whether to build anything heavier. A nonlinear multi-layer head over frozen features is a strict superset of the linear probe's reach while keeping its domain robustness.
+- **Escape-hatch branch (only if Rung 0 finds no signal).** (2+1)D or 3D-conv U-Net on the raw K-frame stack, factorized over (space, time). The only path that can recover physics the frozen encoder discarded, because it sees full-information pixels — and the most transfer-fragile, so it carries R1's load-bearing ablation (measured on real).
+- **Escape-hatch fusion.** Cross-attention with queries from learned-branch tokens and K/V from V-JEPA 2's spatiotemporal tokens. (Feeding *features* instead of pixels into this branch collapses it back to the main-line head — Rung 2's only justification is raw pixels.)
 - **Head input.** Heads consume **clip-level features**. Dynamics heads (CoM, ω, v) read the last-frame slice for their prediction target; depth/normals/seg are predicted per-frame across the K-frame window.
 
 ## Label semantics
