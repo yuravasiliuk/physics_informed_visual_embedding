@@ -21,6 +21,23 @@ from pxr import UsdGeom, UsdLux
 DOME_LIGHT_PRIM_PATH = "/World/env_dome"
 FALLBACK_LIGHT_PRIM_PATH = "/World/default_distant_light"
 FALLBACK_LIGHT_INTENSITY = 3000.0
+# Defensive intensity when an environment USD is already loaded: half the
+# no-env value so authored env lights stay dominant when their textures
+# resolve, but the scene is still visible when they don't (some Isaac envs
+# reference HDRIs under /NVIDIA/Assets/Skies/ which may not be synced).
+FALLBACK_LIGHT_INTENSITY_WITH_ENV = 1500.0
+
+
+def install_fallback_distant_light(intensity: float = FALLBACK_LIGHT_INTENSITY):
+    """Author a single DistantLight at FALLBACK_LIGHT_PRIM_PATH.
+
+    Idempotent — repeated calls overwrite the intensity on the same prim
+    rather than stacking lights.
+    """
+    stage = omni.usd.get_context().get_stage()
+    fallback = UsdLux.DistantLight.Define(stage, FALLBACK_LIGHT_PRIM_PATH)
+    fallback.CreateIntensityAttr().Set(float(intensity))
+    return fallback
 
 
 def setup_random_hdri(rng, config):
@@ -33,9 +50,7 @@ def setup_random_hdri(rng, config):
     Z-axis (azimuthal — Isaac is Z-up).
     """
     if not config.hdri_paths:
-        stage = omni.usd.get_context().get_stage()
-        fallback = UsdLux.DistantLight.Define(stage, FALLBACK_LIGHT_PRIM_PATH)
-        fallback.CreateIntensityAttr().Set(FALLBACK_LIGHT_INTENSITY)
+        install_fallback_distant_light()
         return None
 
     hdri_path = str(rng.choice(config.hdri_paths))

@@ -2,3 +2,4 @@
 .vscode
 .kilo
 .claude
+*__pycache__

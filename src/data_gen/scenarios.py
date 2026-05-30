@@ -22,6 +22,9 @@ so the scene is reproducible from meta.json alone.
 The scenarios.py module is dead code until step 5.3 wires
 `collect_clip.build_scene` to dispatch into these builders.
 """
+import logging
+import math
+
 import numpy as np
 
 import asset_library
@@ -29,6 +32,9 @@ import asset_loader
 import body_factory
 import seg_labels
 import static_geometry
+
+
+logger = logging.getLogger(__name__)
 
 
 # --- shared helpers ---------------------------------------------------------
@@ -278,9 +284,15 @@ def build_settle(world, rng, config):
 
 # --- push -------------------------------------------------------------------
 
-PUSH_SPEED_RANGE = (0.3, 1.5)                # m/s, pure horizontal
+PUSH_SPEED_RANGE = (1.5, 3.5)                # m/s, pure horizontal
 PUSH_SPAWN_XY_RANGE = (-0.3, 0.3)
-PUSH_SPAWN_HEIGHT_RANGE = (0.1, 0.2)         # near-ground; small drop before sliding
+PUSH_SPAWN_HEIGHT_RANGE = (0.15, 0.25)       # half-extent ≲0.075 → no spawn-time
+                                             # ground penetration even for max-scale cuboids
+# Speed range is intentionally higher than `throw`: friction kills sliding
+# motion as `v²/(2μg)`, so with friction ~0.3-0.8 and gravity, anything below
+# ~1 m/s decelerates to a stop in <100 ms and the clip looks like a drop.
+# 1.5-3.5 m/s yields stopping distances ~0.2-1.2 m — visible across the camera
+# frame within the 1-second clip window.
 
 
 def _sample_push_velocity(rng):
@@ -321,18 +333,39 @@ def build_push(world, rng, config):
 
 CLUTTERED_N_STATIC_RANGE = (2, 5)                # inclusive
 CLUTTERED_STATIC_XY_RANGE = (-0.5, 0.5)          # wider than the body footprint
-CLUTTERED_STATIC_MIN_SEPARATION = 0.35           # m between static-asset centers (XY)
+CLUTTERED_STATIC_RADIUS_MARGIN = 0.05            # extra gap between circumscribed circles, m
 CLUTTERED_DYNAMIC_XY_RANGE = (-0.4, 0.4)
 CLUTTERED_DYNAMIC_HEIGHT_RANGE = (1.0, 1.5)      # well above typical asset heights (~0.5 m)
 
 
-def _sample_static_xy(rng, existing, config):
-    """Rejection-sample one XY point at least MIN_SEPARATION from every existing one."""
+def _footprint_radius(footprint_xy: tuple) -> float:
+    """Circumscribed-circle radius of a footprint axis-aligned XY extent.
+
+    Rotation-invariant: an asset rotated by any angle still fits inside a
+    circle of this radius around its center, so we don't have to rotate
+    OBBs per attempt. Conservative (rejects some valid layouts where two
+    long-thin assets could nest), but cheap and good-enough for v0.1.
+    """
+    w, d = footprint_xy
+    return 0.5 * math.hypot(w, d)
+
+
+def _sample_static_placement(rng, existing, new_radius, config):
+    """Rejection-sample one XY point whose disk doesn't overlap any existing disk.
+
+    `existing` is a list of `(cx, cy, radius)` already placed. Returns `(x, y)`
+    or None if no attempt within `config.pose_rejection_max_attempts` cleared
+    all existing disks (accounting for radii on both sides + a small margin).
+    """
     xy_lo, xy_hi = CLUTTERED_STATIC_XY_RANGE
     for _ in range(config.pose_rejection_max_attempts):
         x = float(rng.uniform(xy_lo, xy_hi))
         y = float(rng.uniform(xy_lo, xy_hi))
-        if all(np.hypot(x - px, y - py) > CLUTTERED_STATIC_MIN_SEPARATION for px, py in existing):
+        ok = all(
+            math.hypot(x - cx, y - cy) > new_radius + cr + CLUTTERED_STATIC_RADIUS_MARGIN
+            for cx, cy, cr in existing
+        )
+        if ok:
             return x, y
     return None
 
@@ -343,10 +376,17 @@ def build_cluttered(world, rng, config):
     Dynamic bodies stay primitives for v0.1 — mixing asset bodies into the
     drop set is a later iteration (per plan §3 the cluttered row permits
     "primitive or asset dynamic bodies", and primitive-only is the simpler
-    half). Static assets get a wide XY footprint with minimum separation
-    between centers so they don't visually overlap; dynamic bodies spawn
-    high enough (1.0-1.5 m) that the typical ≤0.5 m asset heights don't
-    intersect them at t=0.
+    half). Static assets are placed using radius-based rejection sampling
+    against per-asset circumscribed circles (footprints measured at library
+    discovery time) so a forklift and a dolly never overlap; dynamic bodies
+    spawn high enough (1.0-1.5 m) that the typical ≤0.5 m asset heights
+    don't intersect them at t=0.
+
+    Assets are sampled and immediately attempted; a sample that can't fit
+    against already-placed disks is *dropped* rather than retried with a
+    smaller asset. This biases the final count downward when the library is
+    skewed toward large props — preferable to looping over assets searching
+    for a fitting one, which would over-represent small assets in busy scenes.
 
     Raises if the asset library is empty — the scenario can't run without
     static props, so the caller should remove "cluttered" from
@@ -360,16 +400,25 @@ def build_cluttered(world, rng, config):
             "'cluttered' from config.scenarios or fix the asset root."
         )
 
-    n_static = int(rng.integers(CLUTTERED_N_STATIC_RANGE[0], CLUTTERED_N_STATIC_RANGE[1] + 1))
-    static_xy: list = []
+    n_static_target = int(rng.integers(
+        CLUTTERED_N_STATIC_RANGE[0], CLUTTERED_N_STATIC_RANGE[1] + 1,
+    ))
+    placed: list = []  # [(cx, cy, radius), ...]
     static_specs = []
-    for i in range(n_static):
-        xy = _sample_static_xy(rng, static_xy, config)
+    for i in range(n_static_target):
+        url, footprint = library.sample_static_prop(rng)
+        radius = _footprint_radius(footprint)
+        xy = _sample_static_placement(rng, placed, radius, config)
         if xy is None:
-            raise _placement_failed("cluttered (static)", n_static, config)
-        static_xy.append(xy)
+            logger.info(
+                "cluttered: gave up placing static asset %d/%d (radius=%.2fm) "
+                "after %d attempts; accepting %d statics",
+                i + 1, n_static_target, radius,
+                config.pose_rejection_max_attempts, len(placed),
+            )
+            break
+        placed.append((xy[0], xy[1], radius))
 
-        url = library.sample_static_prop(rng)
         rotation_deg = float(rng.uniform(0.0, 360.0))
         prim_path = f"/World/static_{i:02d}"
         asset_loader.load_static_asset(
@@ -387,6 +436,7 @@ def build_cluttered(world, rng, config):
             "asset_url": url,
             "position_world": [xy[0], xy[1], 0.0],
             "rotation_z_deg": rotation_deg,
+            "footprint_xy": [float(footprint[0]), float(footprint[1])],
         })
 
     n = _sample_n_bodies(rng, config)
@@ -405,8 +455,10 @@ def build_cluttered(world, rng, config):
     scene_specs = {
         "static_assets": static_specs,
         "scenario_specs": {
-            "n_static_assets": n_static,
+            "n_static_assets_target": n_static_target,
+            "n_static_assets_placed": len(placed),
             "static_xy_range": list(CLUTTERED_STATIC_XY_RANGE),
+            "static_radius_margin": CLUTTERED_STATIC_RADIUS_MARGIN,
             "dynamic_height_range": list(CLUTTERED_DYNAMIC_HEIGHT_RANGE),
         },
     }

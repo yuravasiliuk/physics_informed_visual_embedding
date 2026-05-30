@@ -9,6 +9,7 @@ Working notes on the papers in [../papers](../papers), grouped by relevance to t
 - **[roboscape.md](roboscape.md)** — Dual-branch AR world model with **auxiliary depth + keypoint-dynamics heads** on top of RGB prediction. Same architectural class as the brainstorm but for generation, with labels from pretrained perception models (not a simulator). Closest direct competitor.
 - **[why-auxiliary-tasks-jepa.md](why-auxiliary-tasks-jepa.md)** — Theoretical: the **auxiliary head determines which distinctions the encoder must preserve**. Picks of "center of mass / contact forces / depth" are not arbitrary — they define the equivalence relation the embedding will learn.
 - **[pi-jepa.md](pi-jepa.md)** — PDE-domain JEPA with physics-residual regularizers. Different domain (subsurface flow) but the recipe — split predictor bank per physical sub-process, per-process residual loss — is transferable.
+- **[crossjepa.md](crossjepa.md)** — Cross-modal JEPA (2D→3D) without masking. Inverted goal vs. the brainstorm, but its **latent-information sink** (feed nuisance factors like camera pose and color histogram into the *predictor*) is the most directly portable design idea for sim2real nuisance decoupling.
 
 ## Frozen-encoder candidates / world models
 - **[v-jepa2.md](v-jepa2.md)** — V-JEPA 2 video encoder + action-conditioned predictor. Strong candidate for the "frozen semantic encoder" branch; also shows zero-shot robot planning from RGB alone.
