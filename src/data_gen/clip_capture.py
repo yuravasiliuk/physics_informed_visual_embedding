@@ -225,7 +225,11 @@ def read_local_com(body):
     origin — the exact bug step 5.7 is fixing.
 
     Must be called after `world.reset()` (when the physics view is created).
-    Returns zeros for primitives, whose CoM coincides with the prim origin.
+    Since W2 every primitive carries an authored offset CoM (scale-corrected in
+    body_factory.attach_center_of_mass), so this returns that offset — the
+    physical body-local CoM PhysX integrates — not zeros. It must equal the
+    logged `com_local_authored` (asserted by the offset_com verify case); a
+    uniform body with no authored offset would still read zeros.
     """
     com_pos, _ = body.get_com()
     return np.asarray(com_pos, dtype=np.float64).reshape(3)
@@ -234,10 +238,12 @@ def read_local_com(body):
 def log_state_frame(bodies, local_coms, frame_idx, records, R_camera_world, camera_pos_world, q_camera_world):
     """Append one record per body for the current simulation frame.
 
-    `local_coms[i]` is the body-local CoM offset (read once at scene-build time
-    via read_local_com). World CoM = prim_origin + R(quat_body_world) @ com_local
-    — correct for asymmetric assets, and reduces to the prim origin for
-    uniform-density primitives (where com_local is zero).
+    `local_coms[i]` is the body-local CoM offset (read once post-reset via
+    read_local_com). World CoM = prim_origin + R(quat_body_world) @ com_local —
+    `get_world_pose` returns the prim origin, not the CoM (settled by the W4
+    offset_com verify: reconstructed CoM xy is constant under spin, no
+    double-count). Since W2 com_local is the authored offset for every primitive
+    (it only collapses to the prim origin for a body with no authored offset).
 
     All vectors and orientations are stored in **camera frame**. World frame is
     recoverable from `R_camera_world` in meta.json if downstream code needs it.

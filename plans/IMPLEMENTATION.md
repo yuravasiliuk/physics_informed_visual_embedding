@@ -54,10 +54,12 @@ committed until the Phase-0.5 feasibility probe passes** (see the gate below).
   with `build_scene / simulate_clip / validate_clip` stages.
 - ✅ Supporting modules in place: `asset_library`, `asset_loader`, `body_factory`,
   `scenarios`, `lighting`, `environments`, `static_geometry`, `clip_capture`, `seg_labels`.
-- ✅ `verify_collect_clip.py` written.
-- 🟡 **Verify coverage is thin (R11).** Only a single non-spinning sphere
-  (`com_local == 0`); ω sign/scale, quaternion composition, and the asymmetric-CoM
-  path are untested.
+- ✅ `verify_collect_clip.py` written (CoM=0 sphere smoke test).
+- ✅ **Verify coverage hardened (R11 / #4 / #11).** `verify_physics_labels.py`
+  (W4) adds spin-cuboid (ω sign/scale + quat composition), authored-offset-CoM,
+  and two-body index-swap cases, all at the production camera; 3/3 pass. Caught
+  and fixed two real label bugs (unscaled `centerOfMass`, default angular
+  damping). See [physics-diversification.md](physics-diversification.md) W4.
 - ⬜ **P0.4 — Run `collect_clip.py` end-to-end** under the Isaac Sim Python env;
   confirm the storage-optimized output contract is sane. `save_clip` writes
   **quantized, compressed `.npz`** — not raw `.npy`:
@@ -80,16 +82,22 @@ before any scale generation; the rest are rewrite-and-rerun.*):
 - ✅ **#2 initial velocities persisted** — `body_specs` carries
   `init_lin_vel_world/_camera` + `init_ang_vel_world/_camera`; clips are now
   reconstructable and "predict launch condition" targets are possible.
-- ⬜ **#4 / #11 extend verify** per [BRAINSTORM §6](BRAINSTORM.md#6-what-is-and-isnt-verifiable-critique-4-scope):
-  uniform cuboid edge-axis spin (ω closed form), authored-offset CoM body
-  (`pos + R·offset`), production camera pose, two-body index-swap. *Highest
-  value-per-hour in the critique; precedes any GPU spend.* (Out of scope: general
+- ✅ **#4 / #11 extend verify** per [BRAINSTORM §6](BRAINSTORM.md#6-what-is-and-isnt-verifiable-critique-4-scope):
+  done as `verify_physics_labels.py` (W4) — uniform cuboid spin (ω closed form +
+  quat composition), authored-offset CoM body, production camera pose, two-body
+  index-swap; 3/3 pass. *Was the highest value-per-hour item; the GPU-spend gate
+  (GATE A) is now satisfied on labels.* (Out of scope, as planned: general
   tumbling and PhysX CoM on real meshes — no clean ground truth.)
-- ⬜ **#7 density randomization — research gate.** All bodies use authored/default
-  density today, so a "predict mass" probe only learns visible volume. Add a
-  `density_range` → `MassAPI` (log per body) **before** generation if "mass ⟂ size"
-  (Direction A) is a probe target; otherwise the result is uninterpretable. Cannot
-  be retrofitted.
+- ✅ **#7 density randomization (W1).** `ClipConfig.density_range` sampled per
+  body and applied via `MassAPI.CreateDensityAttr` in `body_factory.spawn_body`;
+  mass is now decoupled from visible volume. `density` + analytic `mass` +
+  post-reset `mass_measured` logged in `body_specs`. Also fixes the
+  non-retrofittable "mass ⟂ size" (Direction A) prerequisite.
+- ✅ **W2 authored offset CoM / W3 observability scenarios** (physics-diversification.md).
+  Per-body scale-corrected offset CoM authored in `spawn_body` (CoM-offset label
+  now has real variance; verified to ~2 nm); new `topple` + `collide` scenarios
+  make CoM/mass-ratio observable. W5 (composite glued bodies) parked until the
+  authored path is trusted in a scale batch.
 - 🟡 **§14 engage resolution decoupling** — the `save_resolution` knob exists but
   defaults to 1024²; dropping labels to ~256² is the ÷16 disk lever (and resolves
   the #1 lossy-RGB debate). Set before the P1 batch. Caveat: target res depends on
@@ -102,9 +110,11 @@ before any scale generation; the rest are rewrite-and-rerun.*):
 - ⬜ **#12 degenerate-camera assert** — `world_to_camera_frame` NaNs when
   `forward ∥ world_up`; add a cheap `|cross| > eps` guard before a top-down scenario
   trips it silently.
-- ⬜ **#8 / #9 mass → `body_specs`** (minor) — mass is logged per-frame in `state.json`
-  but absent from `body_specs`. *By-design / documented, low priority: #1 RGB stays
-  lossy mp4v pending the resolution decision; #10 frame 0 is post-step, not t=0.*
+- ✅ **#8 / #9 mass → `body_specs`** — `body_specs` now carries `mass` (analytic),
+  `mass_measured` (post-reset `get_mass`), and `density` (W1), so mass no longer
+  lives only per-frame in `state.json`. *Remaining by-design / documented, low
+  priority: #1 RGB stays lossy mp4v pending the resolution decision; #10 frame 0
+  is post-step, not t=0.*
 
 ## P0.5 — Gating probes  ⛔ GATE A + GATE B
 
@@ -125,9 +135,12 @@ before any scale generation; the rest are rewrite-and-rerun.*):
 *Spec: [synthetic-data-collection.md §Implementation order](synthetic-data-collection.md#implementation-order),
 [scene-diversification.md](scene-diversification.md), [isaac-asset-diversification.md](isaac-asset-diversification.md).*
 
-> **Blocked on the non-retrofittable P0-hardening decisions** (#7 density, §14
-> resolution): both change dynamics/pixels, so a batch generated before deciding
-> them must be regenerated. Settle them before the Phase-1a pilot.
+> **Non-retrofittable dynamics decisions resolved** (W1 density, W2 offset CoM,
+> W3 observability scenarios — all change dynamics and are landed + W4-verified).
+> One non-retrofittable knob remains: **§14 save resolution** (changes pixels) —
+> settle before the Phase-1a pilot. Also pending first: the P0.4 end-to-end smoke
+> run across scenarios (incl. new `topple`/`collide`) to validate the full
+> pipeline, not just the W4 label core.
 
 - ⬜ **Sanity dashboard** (depth histogram, normals unit-norm, seg coverage, state
   distributions). *Good first contribution.*
