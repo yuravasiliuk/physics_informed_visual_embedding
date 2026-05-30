@@ -141,12 +141,20 @@ def build_scene(world: World, rng: np.random.Generator, config: ClipConfig, env_
     return bodies, body_specs, scene_specs, initial_velocities, scenario_name
 
 
-def simulate_clip(world, bodies, initial_velocities, annots, config, R_camera_world, camera_pos_world, q_camera_world):
+def simulate_clip(world, bodies, initial_velocities, annots, config, R_camera_world, camera_pos_world, q_camera_world, collect_raw_pose=False):
     """Run the K-frame loop, returning captured frames and per-body state records.
 
     `initial_velocities` is a list of (lin_vel_world, ang_vel_world) numpy
     arrays aligned with `bodies`. Velocities are applied AFTER `world.reset()`
     because Isaac discards velocities set before reset.
+
+    `collect_raw_pose` (verify-only hook): when True, also capture each body's
+    raw `get_world_pose()` per frame and return them as a 4-tuple
+    `(frames, state_records, raw_pose_world, raw_quat_world)`. This lets a
+    verification harness probe what `get_world_pose()` actually returns for an
+    offset-CoM body (prim origin vs CoM) independently of `log_state_frame`'s
+    reconstruction — see verify_physics_labels.py W4. Default False keeps the
+    production return shape `(frames, state_records)` untouched.
     """
     world.reset()
     for body, (lin_vel, ang_vel) in zip(bodies, initial_velocities):
@@ -159,6 +167,8 @@ def simulate_clip(world, bodies, initial_velocities, annots, config, R_camera_wo
 
     frames = []
     state_records = []
+    raw_pose_world = [[] for _ in bodies] if collect_raw_pose else None
+    raw_quat_world = [[] for _ in bodies] if collect_raw_pose else None
     for frame_idx in range(config.frame_count):
         world.step(render=True)
         rep.orchestrator.step()  # flush annotator outputs for this frame
@@ -169,6 +179,14 @@ def simulate_clip(world, bodies, initial_velocities, annots, config, R_camera_wo
             camera_pos_world=camera_pos_world,
             q_camera_world=q_camera_world,
         )
+        if collect_raw_pose:
+            for b_i, body in enumerate(bodies):
+                p, q = body.get_world_pose()
+                raw_pose_world[b_i].append(np.asarray(p, dtype=np.float64))
+                raw_quat_world[b_i].append(np.asarray(q, dtype=np.float64))
+
+    if collect_raw_pose:
+        return frames, state_records, raw_pose_world, raw_quat_world
     return frames, state_records
 
 
@@ -279,6 +297,17 @@ def collect_clip(out_dir: str, config: ClipConfig, seed: int, env_override: str 
         world, bodies, initial_velocities, annots, config,
         R_camera_world, camera_pos_world, q_camera_world,
     )
+
+    # Post-reset MEASURED mass properties — the training-truth labels. PhysX
+    # only materializes mass/CoM at world.reset() (done inside simulate_clip),
+    # and both are constant thereafter, so read them back now. The measured CoM
+    # must equal the authored offset (W2 + scale fix); logging the measured
+    # value makes the label self-consistent with the physics by construction
+    # rather than trusting the authored attribute round-tripped correctly.
+    for spec, body in zip(body_specs, bodies):
+        spec["com_local_measured"] = read_local_com(body).tolist()
+        spec["mass_measured"] = float(body.get_mass())
+
     ok, reason = validate_clip(frames, state_records, config)
 
     meta = build_metadata(config, body_specs, scene_specs, scenario_name, R_camera_world, seed)

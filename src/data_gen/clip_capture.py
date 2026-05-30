@@ -37,7 +37,7 @@ class ClipConfig:
     scenarios: tuple = (
         "drop", "roll", "throw",
         "drop_on_platform", "settle", "push",
-        "cluttered",
+        "cluttered", "topple", "collide",
     )                                                                         # uniform sampling per clip
     n_bodies_range: tuple = (3, 8)                                            # inclusive
     shape_choices: tuple = ("cuboid", "sphere", "cylinder", "capsule")
@@ -48,6 +48,16 @@ class ClipConfig:
     static_friction_range: tuple = (0.3, 0.8)
     dynamic_friction_range: tuple = (0.3, 0.8)
     restitution_range: tuple = (0.0, 0.4)
+    # Per-body density (kg/m^3), authored so mass is decoupled from visible
+    # volume (critique #7 / physics-diversification.md W1). ~styrofoam(200) →
+    # steel(8000). Without this, mass = 1000·volume and a "predict mass" probe
+    # only ever learns visible size.
+    density_range: tuple = (200.0, 8000.0)
+    # Per-body CoM offset as a fraction of each half-extent (W2 / R7). Authored
+    # via MassAPI so the CoM-offset label has real variance instead of being
+    # identically zero. 0.3 keeps the CoM well inside the collision volume
+    # (sphere worst case: 0.3*sqrt(3)*r ~= 0.52 r < r). Appearance gives no cue.
+    com_offset_frac: float = 0.3
     init_xy_range: tuple = (-0.3, 0.3)
     init_height_range: tuple = (0.4, 1.2)
     init_ang_vel_range: tuple = (-2.0, 2.0)                                   # rad/s, uniform per axis

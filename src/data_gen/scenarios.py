@@ -138,8 +138,8 @@ def build_roll(world, rng, config):
 
 # --- throw ------------------------------------------------------------------
 
-THROW_SPEED_RANGE = (0.5, 2.0)        # m/s, horizontal magnitude
-THROW_UP_RANGE = (0.0, 0.5)           # m/s, +Z component
+THROW_SPEED_RANGE = (0.5, 12.0)        # m/s, horizontal magnitude
+THROW_UP_RANGE = (0.0, 10.5)           # m/s, +Z component
 
 
 def _sample_throw_velocity(rng):
@@ -465,6 +465,182 @@ def build_cluttered(world, rng, config):
     return bodies, body_specs, scene_specs, initial_velocities
 
 
+# --- topple -----------------------------------------------------------------
+# Observability scenario (physics-diversification.md W3). A tall, small-
+# footprint body standing on the ground is tipped by a horizontal-axis angular
+# kick and topples onto a face. The toppling itself is the dynamic signal;
+# once W2 authors an offset CoM, *which* face it settles on becomes decided by
+# that offset — making CoM strongly observable (the R6 no-signal-in-data fix).
+
+TOPPLE_N_RANGE = (1, 2)                      # inclusive — keep it clean/observable
+TOPPLE_FOOTPRINT_RANGE = (0.05, 0.09)        # small base side / diameter, m
+TOPPLE_HEIGHT_RANGE = (0.25, 0.45)           # tall, m — aspect ratio ~3-9:1
+TOPPLE_TIP_ANGVEL_RANGE = (1.0, 2.5)         # rad/s about a horizontal axis
+TOPPLE_XY_RANGE = (-0.22, 0.22)
+TOPPLE_GROUND_CLEARANCE = 0.005              # spawn just clear of ground (no t=0 penetration)
+TOPPLE_SHAPES = ("cuboid", "cylinder")       # only shapes with a flat base to stand on
+
+
+def _sample_tall_dims(rng, shape):
+    """Tall, small-footprint dims so the body is marginally stable and topples.
+
+    Layout matches sample_shape_dims:
+        cuboid   -> (sx, sy, sz)  small sx,sy; tall sz
+        cylinder -> (r, h)        small r; tall h
+    """
+    if shape == "cuboid":
+        sx = float(rng.uniform(*TOPPLE_FOOTPRINT_RANGE))
+        sy = float(rng.uniform(*TOPPLE_FOOTPRINT_RANGE))
+        sz = float(rng.uniform(*TOPPLE_HEIGHT_RANGE))
+        return (sx, sy, sz)
+    # cylinder: footprint range is a diameter, so radius is half of it
+    r = 0.5 * float(rng.uniform(*TOPPLE_FOOTPRINT_RANGE))
+    h = float(rng.uniform(*TOPPLE_HEIGHT_RANGE))
+    return (r, h)
+
+
+def _standing_half_height(shape, dims):
+    """Half the vertical extent of a body resting upright on its base."""
+    if shape == "cuboid":
+        return 0.5 * dims[2]
+    return 0.5 * dims[1]              # cylinder height
+
+
+def _standing_footprint_radius(shape, dims):
+    """In-plane circumscribed radius of the base, for XY non-overlap spacing."""
+    if shape == "cuboid":
+        return 0.5 * float(np.hypot(dims[0], dims[1]))
+    return dims[0]                    # cylinder radius
+
+
+def _sample_horizontal_angvel(rng):
+    """Angular velocity about a random horizontal axis — the tip-over kick.
+
+    Z-component is zero: a vertical spin would not topple an upright body, so
+    all of the kick goes into rotating it about a horizontal axis through its
+    base, carrying the CoM past the support edge.
+    """
+    mag = float(rng.uniform(*TOPPLE_TIP_ANGVEL_RANGE))
+    az = rng.uniform(0.0, 2.0 * np.pi)
+    return np.array([mag * np.cos(az), mag * np.sin(az), 0.0])
+
+
+def build_topple(world, rng, config):
+    """1-2 tall bodies standing on the ground, kicked so they tip and settle."""
+    n = int(rng.integers(TOPPLE_N_RANGE[0], TOPPLE_N_RANGE[1] + 1))
+    shapes = [rng.choice(TOPPLE_SHAPES).item() for _ in range(n)]
+    dims_list = [_sample_tall_dims(rng, s) for s in shapes]
+    radii = [_standing_footprint_radius(shapes[i], dims_list[i]) for i in range(n)]
+
+    # Rejection-sample distinct XY base centers; z is pinned per body to its
+    # standing half-height, so we can't reuse sample_non_overlapping_positions
+    # (which samples z from a range).
+    xy_lo, xy_hi = TOPPLE_XY_RANGE
+    centers = []
+    for r_i in radii:
+        for _ in range(config.pose_rejection_max_attempts):
+            cand = rng.uniform([xy_lo, xy_lo], [xy_hi, xy_hi])
+            if all(
+                np.linalg.norm(cand - c) > 1.10 * (r_i + r_j)
+                for c, r_j in zip(centers, radii)
+            ):
+                centers.append(cand)
+                break
+        else:
+            raise _placement_failed("topple", n, config)
+
+    bodies, body_specs = [], []
+    for i in range(n):
+        half_h = _standing_half_height(shapes[i], dims_list[i])
+        pos = np.array([centers[i][0], centers[i][1], half_h + TOPPLE_GROUND_CLEARANCE])
+        body, spec = body_factory.spawn_body(
+            world, rng, config, i, shapes[i], dims_list[i], pos,
+        )
+        bodies.append(body)
+        body_specs.append(spec)
+
+    initial_velocities = [
+        (_zero_linear_velocity(), _sample_horizontal_angvel(rng)) for _ in bodies
+    ]
+    scene_specs = {
+        "static_assets": [],
+        "scenario_specs": {
+            "tip_angvel_range": list(TOPPLE_TIP_ANGVEL_RANGE),
+            "footprint_range": list(TOPPLE_FOOTPRINT_RANGE),
+            "height_range": list(TOPPLE_HEIGHT_RANGE),
+        },
+    }
+    return bodies, body_specs, scene_specs, initial_velocities
+
+
+# --- collide ----------------------------------------------------------------
+# Observability scenario (physics-diversification.md W3). Two bodies on a
+# shared horizontal axis are aimed at each other so they impact near the
+# origin. Momentum exchange makes the *mass ratio* observable — the only way
+# mass (now decoupled from volume by W1) becomes a learnable target rather than
+# a relabelling of visible size.
+
+COLLIDE_HALF_SEP_RANGE = (0.30, 0.42)        # m, each body's distance from origin
+COLLIDE_SPEED_RANGE = (1.5, 3.0)             # m/s, horizontal closing speed per body
+COLLIDE_HEIGHT_RANGE = (0.12, 0.22)          # m, shared spawn height of both centers
+COLLIDE_AIM_JITTER_DEG = 8.0                 # max ± aim jitter so it's not perfectly 1D
+
+
+def _rot_z(vec, ang):
+    """Rotate a 3-vector about +Z by `ang` radians."""
+    c, s = np.cos(ang), np.sin(ang)
+    x, y, z = vec
+    return np.array([c * x - s * y, s * x + c * y, z])
+
+
+def build_collide(world, rng, config):
+    """Two bodies launched toward each other along a shared axis; they impact.
+
+    Both centers spawn at a common height so they actually meet rather than one
+    sailing over the other. Velocities point inward (toward the origin) with a
+    small per-body aim jitter, so most collisions are near-head-on but not a
+    degenerate 1-D line every clip.
+    """
+    azimuth = rng.uniform(0.0, 2.0 * np.pi)
+    u = np.array([np.cos(azimuth), np.sin(azimuth), 0.0])
+    half_sep = float(rng.uniform(*COLLIDE_HALF_SEP_RANGE))
+    z0 = float(rng.uniform(*COLLIDE_HEIGHT_RANGE))
+
+    shapes = [rng.choice(config.shape_choices).item() for _ in range(2)]
+    dims_list = [body_factory.sample_shape_dims(rng, s, config.scale_range) for s in shapes]
+
+    # Body 0 at +half_sep along u (moving -u), body 1 at -half_sep (moving +u).
+    positions = [half_sep * u + np.array([0.0, 0.0, z0]),
+                 -half_sep * u + np.array([0.0, 0.0, z0])]
+    inward = [-u, u]
+
+    bodies, body_specs = [], []
+    initial_velocities = []
+    jitter = np.deg2rad(COLLIDE_AIM_JITTER_DEG)
+    for i in range(2):
+        body, spec = body_factory.spawn_body(
+            world, rng, config, i, shapes[i], dims_list[i], positions[i],
+        )
+        bodies.append(body)
+        body_specs.append(spec)
+        speed = float(rng.uniform(*COLLIDE_SPEED_RANGE))
+        aim = float(rng.uniform(-jitter, jitter))
+        lin_vel = speed * _rot_z(inward[i], aim)
+        initial_velocities.append((lin_vel, _sample_angular_velocity(rng, config)))
+
+    scene_specs = {
+        "static_assets": [],
+        "scenario_specs": {
+            "axis_azimuth_rad": azimuth,
+            "half_separation": half_sep,
+            "spawn_height": z0,
+            "speed_range": list(COLLIDE_SPEED_RANGE),
+            "aim_jitter_deg": COLLIDE_AIM_JITTER_DEG,
+        },
+    }
+    return bodies, body_specs, scene_specs, initial_velocities
+
+
 # --- registry ---------------------------------------------------------------
 
 BUILDERS = {
@@ -475,9 +651,36 @@ BUILDERS = {
     "settle": build_settle,
     "push": build_push,
     "cluttered": build_cluttered,
+    "topple": build_topple,
+    "collide": build_collide,
+}
+
+# Coarse expected-observability hint per scenario (physics-diversification.md
+# W3). Consumed later by the observability-weighted loss (R6) and dataset
+# balancing. Injected into scene_specs.scenario_specs by `build` below so the
+# tag lives in meta.json without each builder having to set it.
+#   free_flight  — mostly ballistic, weak contact (mass/CoM weakly observable)
+#   contact      — sustained ground/scenery contact (CoM observable via tumbling)
+#   collision    — inter-body momentum exchange (mass ratio observable)
+OBSERVABILITY_HINT = {
+    "drop": "contact",
+    "roll": "contact",
+    "throw": "free_flight",
+    "drop_on_platform": "contact",
+    "settle": "contact",
+    "push": "contact",
+    "cluttered": "contact",
+    "topple": "contact",
+    "collide": "collision",
 }
 
 
 def build(scenario_name: str, world, rng, config):
     """Dispatch by name. Raises KeyError if the scenario is unknown."""
-    return BUILDERS[scenario_name](world, rng, config)
+    bodies, body_specs, scene_specs, initial_velocities = BUILDERS[scenario_name](
+        world, rng, config,
+    )
+    scene_specs.setdefault("scenario_specs", {})["observability_hint"] = (
+        OBSERVABILITY_HINT.get(scenario_name, "unknown")
+    )
+    return bodies, body_specs, scene_specs, initial_velocities

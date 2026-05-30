@@ -26,6 +26,9 @@ at the [root README](../README.md) — this doc does not duplicate it.
 **This brainstorm cluster:**
 - **BRAINSTORM.md** (this file) — architecture, risks (R1–R11), CoM formulation,
   sim→real strategy, verifiability, open decisions.
+- [IMPLEMENTATION.md](IMPLEMENTATION.md) — operational status tracker: what's done,
+  what's next, and the two hard gates. The *why* for each item lives here; that doc
+  tracks the *state*.
 - [observability-weighted-loss.md](observability-weighted-loss.md) — spun off from
   **R6 / §4**: weight physics loss by angular displacement + contact (not linear
   velocity); learned heteroscedastic σ.

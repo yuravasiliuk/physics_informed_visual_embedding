@@ -20,6 +20,7 @@ from omni.isaac.core.objects import (
     DynamicCylinder,
     DynamicSphere,
 )
+from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics
 
 from seg_labels import apply_class_label
 
@@ -48,6 +49,153 @@ def sample_shape_dims(rng, shape, scale_range):
     if shape in ("cylinder", "capsule"):
         return (float(rng.uniform(lo, hi) * 0.5), float(rng.uniform(lo, hi)))
     raise ValueError(f"Unknown shape: {shape}")
+
+
+def shape_volume(shape, dims):
+    """Analytic volume (m^3) of a primitive.
+
+    Matches PhysX's mass integration for box/sphere/cylinder/capsule, so
+    `density * shape_volume` equals the mass PhysX resolves at world.reset()
+    (cross-checked against state.json's per-frame `get_mass()`). dims layout
+    mirrors sample_shape_dims:
+        cuboid   -> (sx, sy, sz)   full side lengths
+        sphere   -> (r,)
+        cylinder -> (r, h)
+        capsule  -> (r, h)         cylinder of length h + two hemisphere caps
+    """
+    if shape == "cuboid":
+        return float(dims[0] * dims[1] * dims[2])
+    if shape == "sphere":
+        r = dims[0]
+        return float(4.0 / 3.0 * np.pi * r ** 3)
+    if shape == "cylinder":
+        r, h = dims
+        return float(np.pi * r ** 2 * h)
+    if shape == "capsule":
+        r, h = dims
+        return float(np.pi * r ** 2 * h + 4.0 / 3.0 * np.pi * r ** 3)
+    raise ValueError(f"Unknown shape: {shape}")
+
+
+def attach_density(prim, density):
+    """Author per-body density via UsdPhysics.MassAPI.
+
+    PhysX computes mass = density * collision-shape-volume (and the inertia
+    tensor) at world.reset(). No explicit mass/inertia attr is set, so density
+    is the sole driver. Paired with attach_center_of_mass (W2), which overrides
+    only the CoM; mass + inertia stay PhysX-computed and scale-correct.
+    """
+    mass_api = UsdPhysics.MassAPI.Apply(prim)
+    mass_api.CreateDensityAttr().Set(float(density))
+
+
+def half_extents(shape, dims):
+    """Per-axis half-extent of the collision volume (np.array of 3 floats).
+
+    Used to bound a sampled CoM offset so it stays inside the body. Sphere
+    uses its radius on all three axes; cylinder/capsule use radius on x,y and
+    half the cylinder length on z (their local symmetry axis).
+    """
+    if shape == "cuboid":
+        return np.array([0.5 * dims[0], 0.5 * dims[1], 0.5 * dims[2]])
+    if shape == "sphere":
+        r = dims[0]
+        return np.array([r, r, r])
+    if shape in ("cylinder", "capsule"):
+        r, h = dims
+        return np.array([r, r, 0.5 * h])
+    raise ValueError(f"Unknown shape: {shape}")
+
+
+def inertia_diagonal(shape, dims, mass):
+    """Principal moments (Ixx, Iyy, Izz) of a uniform-density primitive about
+    its centroid, in the body frame (np.array of 3 floats).
+
+    The body axes are the principal axes for all four shapes, so this is the
+    diagonal inertia with identity principal-axes orientation. NOT authored:
+    we let PhysX compute inertia from density + geometry (scale-correct, and
+    consistent with the offset CoM). Retained — Monte-Carlo-validated to <0.03%
+    — as a reference / potential future label, not used at spawn time.
+
+    cylinder/capsule symmetry axis = local Z (Isaac's default), matching the
+    (r, h) dims layout. Capsule = cylinder(length h) + two hemispherical caps
+    (radius r); component masses split by uniform density rho = mass / volume.
+    """
+    if shape == "cuboid":
+        a, b, c = dims
+        return mass / 12.0 * np.array([b*b + c*c, a*a + c*c, a*a + b*b])
+    if shape == "sphere":
+        r = dims[0]
+        i = 0.4 * mass * r * r
+        return np.array([i, i, i])
+    if shape == "cylinder":
+        r, h = dims
+        izz = 0.5 * mass * r * r
+        ixx = mass * (r*r / 4.0 + h*h / 12.0)
+        return np.array([ixx, ixx, izz])
+    if shape == "capsule":
+        r, h = dims
+        rho = mass / shape_volume("capsule", dims)
+        m_cyl = rho * np.pi * r * r * h
+        m_sph = rho * (4.0 / 3.0) * np.pi * r ** 3      # both hemispherical caps
+        izz = 0.5 * m_cyl * r * r + 0.4 * m_sph * r * r
+        ixx = (m_cyl * (r*r / 4.0 + h*h / 12.0)
+               + m_sph * (0.4 * r*r + h*h / 4.0 + 0.375 * h * r))
+        return np.array([ixx, ixx, izz])
+    raise ValueError(f"Unknown shape: {shape}")
+
+
+def prim_local_scale(prim):
+    """Per-axis local scale of a prim from its USD xform (np.array of 3).
+
+    Robust to however Isaac builds each shape: a cuboid is a unit Cube with
+    xformOp:scale = dims, while sphere/cylinder/capsule set their geometry
+    size directly (scale = 1). We read the composed local transform rather than
+    assume, because the MassAPI CoM is authored in unscaled local space.
+    """
+    m = UsdGeom.Xformable(prim).GetLocalTransformation()
+    s = Gf.Transform(m).GetScale()
+    return np.array([s[0], s[1], s[2]], dtype=np.float64)
+
+
+def attach_center_of_mass(prim, com_local, prim_scale):
+    """Author an offset CoM via MassAPI, scale-corrected (W2 + W4 fix).
+
+    `com_local` is the intended CoM offset in PHYSICAL body-local metres. USD's
+    MassAPI centerOfMass is interpreted in the prim's UNSCALED local space, so
+    we divide by the prim scale: physical CoM = attr * scale. Without this a
+    scaled prim (a cuboid built with scale=dims) silently shrinks the offset by
+    the scale factor and decouples it from the logged label — the bug the W4
+    verify caught. Mass + inertia are left to PhysX (computed from density +
+    geometry about this CoM); the offset CoM is the only mass property we pin.
+    The authored value is cross-checked post-reset against read_local_com.
+    """
+    mass_api = UsdPhysics.MassAPI.Apply(prim)
+    com_attr = np.asarray(com_local, dtype=np.float64) / np.asarray(prim_scale, dtype=np.float64)
+    mass_api.CreateCenterOfMassAttr().Set(
+        Gf.Vec3f(float(com_attr[0]), float(com_attr[1]), float(com_attr[2]))
+    )
+
+
+def zero_damping(prim):
+    """Remove PhysX's default velocity damping (W4 fix).
+
+    PhysX applies a per-step exponential decay (omega /= 1 + angular_damping*dt,
+    likewise for linear) — a numerical/authoring knob, NOT real aerodynamics.
+    The default ~0.05 angular term silently bled ~1.7%/clip off spin (the W4
+    spin_cuboid case caught it). At these scales (sub-metre, ~m/s, ~1 s) real
+    air drag is negligible, so zero is both cleaner and more faithful: free
+    flight is governed only by gravity + initial velocity, and bodies still
+    settle via friction/restitution/contact. Keeping it controlled also means
+    angular momentum is conserved through collisions (the `collide` mass signal)
+    and we don't depend on a PhysX default that could change between versions.
+    """
+    if prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+        rb = PhysxSchema.PhysxRigidBodyAPI(prim)
+    else:
+        rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+    rb.CreateLinearDampingAttr().Set(0.0)
+    rb.CreateAngularDampingAttr().Set(0.0)
 
 
 def bounding_radius(shape, dims):
@@ -152,6 +300,88 @@ def _sample_roughness_metallic(rng, config):
     return roughness, metallic
 
 
+def spawn_body(world, rng, config, i, shape, dims, position, color=None):
+    """Spawn one fully-decorated dynamic primitive; return (body, spec).
+
+    The shared per-body construction used by `build_random_bodies` (which
+    samples shape/dims/position) and by the bespoke scenario builders
+    `topple`/`collide` (which choose them explicitly). Centralizing it keeps
+    the W1 density path — and the physics/PBR/label/spec treatment — identical
+    across both call sites, so a single edit can't decouple mass from volume in
+    one place and not the other.
+
+    `i` is the body index; name/prim_path/id are derived from it to match the
+    existing convention. `color` is sampled if None. RNG draw order is
+    color -> density -> friction(s) -> restitution -> roughness/metallic,
+    matching the original inline loop exactly.
+    """
+    stage = omni.usd.get_context().get_stage()
+    name = f"body_{i:02d}"
+    prim_path = f"/World/{name}"
+    if color is None:
+        color = sample_color(
+            rng, config.color_hue_range, config.color_sat_range, config.color_val_range,
+        )
+    body = make_body(
+        world, prim_path=prim_path, name=name,
+        shape=shape, dims=dims, position=position, color=color,
+    )
+    prim = stage.GetPrimAtPath(prim_path)
+    # W1: decouple mass from visible volume via a per-body density (PhysX
+    # resolves mass = density * volume at reset; we log the analytic value,
+    # which matches, plus the measured get_mass() post-reset as the label).
+    # W2: author an offset CoM so the CoM-offset label has real variance. The
+    # offset is a per-axis fraction of the half-extent, bounded inside the
+    # collision volume, scale-corrected in attach_center_of_mass, and verified
+    # against read_local_com post-reset. Inertia is left to PhysX. Appearance
+    # gives no cue to the CoM. (physics-diversification.md W1+W2 / #7,#9; R7.)
+    density = float(rng.uniform(*config.density_range))
+    volume = shape_volume(shape, dims)
+    mass = density * volume
+    com_local = (
+        rng.uniform(-config.com_offset_frac, config.com_offset_frac, size=3)
+        * half_extents(shape, dims)
+    )
+    attach_density(prim, density)
+    attach_center_of_mass(prim, com_local, prim_local_scale(prim))
+    zero_damping(prim)
+    sf = float(rng.uniform(*config.static_friction_range))
+    df = float(rng.uniform(*config.dynamic_friction_range))
+    rest = float(rng.uniform(*config.restitution_range))
+    attach_physics_material(
+        body, prim_path=f"{prim_path}/physics_material",
+        static_friction=sf, dynamic_friction=df, restitution=rest,
+    )
+    roughness, metallic = _sample_roughness_metallic(rng, config)
+    attach_pbr_material(
+        body, prim_path=f"{prim_path}/visual_material",
+        color=color, roughness=roughness, metallic=metallic,
+    )
+    # Per-body class label — step 5.8 collapses prims under one class to
+    # one segmentation ID, so each primitive body gets its own class
+    # (matches asset bodies, which use `name` as their class label too).
+    apply_class_label(prim, name)
+    spec = {
+        "id": i + 1,
+        "name": name,
+        "shape": shape,
+        "asset_url": None,
+        "dims": list(map(float, dims)),
+        "color_rgb": [float(c) for c in color],
+        "roughness": roughness,
+        "metallic": metallic,
+        "static_friction": sf,
+        "dynamic_friction": df,
+        "restitution": rest,
+        "density": density,
+        "volume": volume,
+        "mass": mass,
+        "com_local_authored": [float(x) for x in com_local],
+        "init_position_world": [float(x) for x in position],
+    }
+    return body, spec
+
+
 def build_random_bodies(world, rng, config, n_bodies, xy_range=None, height_range=None):
     """Sample shapes, dims, colors, positions, frictions; spawn `n_bodies`.
 
@@ -175,49 +405,12 @@ def build_random_bodies(world, rng, config, n_bodies, xy_range=None, height_rang
     if positions is None:
         return None, None
 
-    stage = omni.usd.get_context().get_stage()
     bodies = []
     specs = []
     for i in range(n_bodies):
-        name = f"body_{i:02d}"
-        prim_path = f"/World/{name}"
-        color = sample_color(
-            rng, config.color_hue_range, config.color_sat_range, config.color_val_range,
+        body, spec = spawn_body(
+            world, rng, config, i, shapes[i], dims_list[i], positions[i],
         )
-        body = make_body(
-            world, prim_path=prim_path, name=name,
-            shape=shapes[i], dims=dims_list[i],
-            position=positions[i], color=color,
-        )
-        sf = float(rng.uniform(*config.static_friction_range))
-        df = float(rng.uniform(*config.dynamic_friction_range))
-        rest = float(rng.uniform(*config.restitution_range))
-        attach_physics_material(
-            body, prim_path=f"{prim_path}/physics_material",
-            static_friction=sf, dynamic_friction=df, restitution=rest,
-        )
-        roughness, metallic = _sample_roughness_metallic(rng, config)
-        attach_pbr_material(
-            body, prim_path=f"{prim_path}/visual_material",
-            color=color, roughness=roughness, metallic=metallic,
-        )
-        # Per-body class label — step 5.8 collapses prims under one class to
-        # one segmentation ID, so each primitive body gets its own class
-        # (matches asset bodies, which use `name` as their class label too).
-        apply_class_label(stage.GetPrimAtPath(prim_path), name)
         bodies.append(body)
-        specs.append({
-            "id": i + 1,
-            "name": name,
-            "shape": shapes[i],
-            "asset_url": None,
-            "dims": list(map(float, dims_list[i])),
-            "color_rgb": [float(c) for c in color],
-            "roughness": roughness,
-            "metallic": metallic,
-            "static_friction": sf,
-            "dynamic_friction": df,
-            "restitution": rest,
-            "init_position_world": [float(x) for x in positions[i]],
-        })
+        specs.append(spec)
     return bodies, specs
