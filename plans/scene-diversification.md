@@ -14,6 +14,8 @@ This plan introduces **v0.1** — a richer scene generator that still uses the v
 | Single archetype (drop) | `lin_vel_camera` is essentially `g·t·R_cw·ẑ_world + ε`. The encoder can predict it from the frame index alone — no actual physics decoding needed. |
 | No static geometry | Bodies never interact with the scene — no rolling, no bouncing, no settling. ω is purely initial + air resistance. |
 | Default ground plane + single distant light | Identical background across clips. The encoder cannot distinguish "lighting" from "object" — no scene cues for object segmentation beyond color. |
+| Flat single-color ground | No texture on the floor → no parallax / translation anchor. A body sliding across a uniform plane gives the encoder almost no positional cue from the background; depth and normals of the ground are featureless. |
+| Single hardcoded static camera `(2.2,2.2,1.8)→(0,0,0.1)` | Every clip shares one viewpoint and one projection. A frozen-encoder probe can latch onto the fixed projection; zero viewpoint generalization, and the sim→real story has no camera-pose variation. |
 | Primitive shapes only | Visual distribution is far from anything photorealistic. Even if the probe works on this, the result tells us nothing about V-JEPA 2's actual physics encoding on realistic video. |
 | Diffuse-only materials | No specular highlights, no reflections — no shading cues for surface orientation or material identity. |
 
@@ -31,6 +33,7 @@ The first three symptoms hurt physics signal directly. The last two hurt sim→r
 | **D. Ground / background** | Default plane (uniform) | Random PBR ground material (asphalt, wood, concrete, fabric) | Medium — gives texture cues for segmentation |
 | **E. Material** | Diffuse + random HSV | PBR (random roughness, occasional metallic) | Low for v0.1; matters more at v1 |
 | **F. Asset richness** *(new)* | Primitives only | Isaac default assets — pallets, crates, robotic arms (static), tool boxes — alongside primitives | **High** — closes the sim→real visual gap that the entire project hinges on |
+| **G. Camera viewpoint** *(new, v0.2)* | One hardcoded static pose | Per-rollout rig of N jittered viewpoints on a shell around the scene; each view saved as an independent clip | **High** — kills the fixed-projection shortcut and yields free multi-view-consistent samples (see §10) |
 
 Axes are independent; pick a subset per tier.
 
@@ -222,6 +225,15 @@ Backwards-compatible additions to `meta.json` only — no field renames:
     ],
     "scenario_specs": {"ramp_angle_deg": 25.0}   // archetype-specific, free-form
   },
+  // v0.2 multi-view provenance (axis G, §10). Each clip is still single-camera:
+  // its meta already carries camera_position_world / camera_look_at_world /
+  // R_camera_world for THIS view. `multiview` only links the N sibling clips
+  // that share one physics rollout — independent on disk, groupable by metadata.
+  "multiview": {
+    "rollout_seed": 1234,    // identical across the N siblings of one rollout
+    "camera_index": 3,       // 0..n_cameras-1
+    "n_cameras": 7
+  },
   "bodies": [
     {
       "id": 1, "name": "body_00", "shape": "asset",
@@ -249,6 +261,94 @@ For primitive bodies, `asset_url` is null and `shape` stays one of `cuboid/spher
 3. **Mass override policy.** Trust shipped USD masses or override per category? Recommend trust for v0.1, revisit for v1.
 4. **`cluttered` weighting.** What fraction of v0.1 should be `cluttered`? Tradeoff: more cluttered → more photorealistic but slower to generate and harder to validate. Start at 30%; tune by inspection.
 5. **License audit for Isaac default assets.** NVIDIA's standard Omniverse license generally allows research use, but worth confirming before any public release.
+
+---
+
+## 10. Camera viewpoint diversity + multi-view capture (axis G, v0.2)
+
+*Addresses the hardcoded-camera and flat-ground symptoms in §1. Decided with the
+user 2026-05-30. Companion to the physics fidelity pass
+([[physics-diversification]] W1–W4).*
+
+### 10.1 Multi-camera fan-out — N independent clips per physics rollout
+
+The key efficiency lever: the **expensive** work per clip is the fixed cost
+(Isaac boot, scene build, asset load, physics warmup, the physics rollout
+itself); **rendering a frozen scene from another pose is cheap**. So one physics
+rollout is rendered from `n_cameras` viewpoints at once and **fanned out into
+`n_cameras` independent clips**.
+
+- **Physics steps once per frame.** Each frame: `world.step()` → one
+  `rep.orchestrator.step()` flushes all N render products → for each camera,
+  `capture()` its annotators and `log_state_frame()` with *that* camera's
+  extrinsics, on the same physics state.
+- **Each camera = a standalone clip in its own folder**, byte-for-byte the same
+  layout as a single-camera clip (own `rgb.mp4` / `depth.npz` / `normals.npz` /
+  `seg.npz` / `state.json` / `meta.json`). **Decision (user): the N siblings are
+  NOT bundled into one folder.** A rollout of N cameras over M rollouts yields
+  `M·N` top-level clip folders.
+- **The per-clip contract is therefore unchanged.** `state.json` stays in *that
+  camera's* frame; `meta.json` carries that camera's single `R_camera_world`.
+  No world-frame migration; the W4 verify (single-camera reconstruction) is
+  untouched. The only addition is the `multiview` provenance block (§8) so the
+  siblings can be regrouped later for multi-view / viewpoint-invariance work.
+- **Why not just generate N independent clips?** Because these N share *identical
+  dynamics* — exactly the "same physics, different viewpoint" signal the
+  domain-marginalization regularizer (P3) and a 3D-aware frozen encoder want, and
+  which independent rollouts cannot provide.
+
+### 10.2 Camera rig — predefined viewpoints + per-rollout jitter
+
+A canonical rig of `n_cameras` viewpoints on a shell around the scene centroid,
+jittered per rollout (user's "predefined set, jitter with reasonable noise"):
+
+- Spherical params per camera: **azimuth** spread evenly (≈`360/n` apart),
+  **elevation** spread across a band (≈20–55°, always positive so the camera
+  looks *down* onto the cluster and never sits under the floor), **radius**
+  ≈2.8–3.6 m, **look-at** near the scene centroid `(0,0,~0.12)`.
+- Per-rollout jitter: ±azimuth, ±elevation (clamped), ±radius, ±look-at, so no
+  two rollouts share a projection while the rig stays well-conditioned.
+- `world_to_camera_frame` gets a **degenerate-camera guard** (critique #12):
+  reject/clamp any view whose forward is near-parallel to world-up (NaN in the
+  `cross(forward, up)`), which the higher rig elevations could otherwise trip.
+
+### 10.3 Visibility / occlusion (user requirement: "object must be visible")
+
+Two layers, in order of cost:
+
+1. **Geometric** — inward-looking shell at positive elevation means cameras look
+   down onto the object cluster near the origin; they cannot be inside geometry
+   or below ground. Bounded radius keeps the scene in FOV.
+2. **Per-camera validation** — generalize the existing `validate_clip`
+   foreground/`empty_seg` check to *per camera*: a view whose target-pixel
+   coverage is too low (a body fully occluded behind a `cluttered` wall) fails
+   validation for *its* clip only; the sibling views are unaffected.
+   *v0.2 scope:* post-hoc per-camera validation (failed view → `validation.ok=False`).
+   *Follow-up (noted, not in v0.2):* a t=0 pre-flight render that re-jitters a
+   camera whose start coverage is poor, to guarantee N good views per rollout.
+
+### 10.4 Ground texture — visible grid (axis D, concrete choice)
+
+The flat-color ground gives no spatial anchor. **Decision (user): grid-line
+floor** (the Isaac-default-grid aesthetic, but generated locally — the shipped
+default ground hits the asset server, which our `/Isaac`-only mirror lacks).
+
+- Generate a grid-line texture PNG locally (numpy + cv2), cache it, and bind it
+  to the `GroundPlane` via `OmniPBR(texture_path=…, texture_scale=…)`
+  (`GroundPlane(visual_material=…)` / `apply_visual_material` — confirmed API).
+- Randomize per clip via `texture_scale` (apparent line spacing) + base-color
+  tint, for diversity without regenerating the texture.
+- Suppressed when an environment USD ships its own floor (as today).
+
+### 10.5 Budget & cost
+
+- VRAM/throughput scale with **render resolution × n_cameras** (render res, not
+  `save_resolution`, is what sits in VRAM). Target box: **24 GB, headless**.
+- **Start at `n_cameras = 7`** (user). Tune count / render res after the first
+  VRAM check; engage the §14 `save_resolution` drop to keep disk in check
+  (`M·N` clips multiplies storage).
+- Transient host RAM holds all N cameras' frames for one rollout (physics
+  produces them interleaved per timestep), then writes and frees per camera.
 
 ---
 

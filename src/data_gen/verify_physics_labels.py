@@ -148,10 +148,11 @@ def case_spin_cuboid(world, config, R_cw, cam_pos, q_cw, seed):
     apply_class_label(spin_prim, "spin_cuboid")
     body_factory.zero_damping(spin_prim)   # match production: no PhysX default damping
     init_v = [(np.zeros(3), np.array([0.0, 0.0, omega]))]
-    frames, recs = simulate_clip(
-        world, [cuboid], init_v, _annots(config),
-        config, R_cw, cam_pos, q_cw,
+    cam_frames, cam_recs = simulate_clip(
+        world, [cuboid], init_v, [_annots(config)],
+        config, [(R_cw, cam_pos, q_cw)],
     )
+    frames, recs = cam_frames[0], cam_recs[0]
 
     # Torque-free (constant omega about +Z) only while airborne; a cube spinning
     # about +Z keeps its bottom face flat, so the lowest point stays at
@@ -209,10 +210,11 @@ def case_offset_com(world, config, R_cw, cam_pos, q_cw, seed):
     com_authored = np.array(spec["com_local_authored"], dtype=np.float64)
 
     init_v = [(np.zeros(3), np.array([0.0, 0.0, omega]))]
-    frames, recs = simulate_clip(
-        world, [body], init_v, _annots(config),
-        config, R_cw, cam_pos, q_cw,
+    cam_frames, cam_recs = simulate_clip(
+        world, [body], init_v, [_annots(config)],
+        config, [(R_cw, cam_pos, q_cw)],
     )
+    frames, recs = cam_frames[0], cam_recs[0]
 
     air = _airborne_mask(config, bottom_height_m=start[2] - side / 2.0)
     idx = np.where(air)[0]
@@ -275,10 +277,11 @@ def case_two_body(world, config, R_cw, cam_pos, q_cw, seed):
         )
         bodies.append(b)
     init_v = [(np.zeros(3), np.zeros(3)) for _ in bodies]
-    frames, recs = simulate_clip(
-        world, bodies, init_v, _annots(config),
-        config, R_cw, cam_pos, q_cw,
+    cam_frames, cam_recs = simulate_clip(
+        world, bodies, init_v, [_annots(config)],
+        config, [(R_cw, cam_pos, q_cw)],
     )
+    frames, recs = cam_frames[0], cam_recs[0]
 
     # First logged frame: each body's com_world must sit near its own spawn xy,
     # not the other's. A swap shows up as the wrong start point.

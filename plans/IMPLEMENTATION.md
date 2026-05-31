@@ -116,6 +116,31 @@ before any scale generation; the rest are rewrite-and-rerun.*):
   priority: #1 RGB stays lossy mp4v pending the resolution decision; #10 frame 0
   is post-step, not t=0.*
 
+**Scene-diversity v0.2 — found on inspection 2026-05-30** (*next implementation
+batch; one Isaac smoke cycle. Specs:
+[scene-diversification.md §10](scene-diversification.md) +
+[physics-diversification.md W3a](physics-diversification.md). Change dynamics
+(topple) and pixels/viewpoint (camera, ground) → settle before the P1 batch.*):
+
+- ⬜ **W3a `topple` energy-barrier fix** — the tip kick is below the tipping
+  barrier, so `topple` looks static. Fix: spawn leaning just past θ_crit + small
+  kick (gravity topples it; offset CoM biases the landing face). Adds an
+  `orientation` param to `make_body`/`spawn_body`. *Was a silent physics bug —
+  the new scenario produced near-zero motion.*
+- ⬜ **Multi-view capture (axis G)** — render each physics rollout from
+  `n_cameras=7` jittered viewpoints and fan out into **N independent clips**
+  (own folder, single-camera contract unchanged; siblings linked by a
+  `multiview` provenance block). Physics steps once → big throughput win + free
+  multi-view-consistent samples. Per-camera `validate_clip`. Target box 24 GB
+  headless; pair with the §14 `save_resolution` drop.
+- ⬜ **#12 degenerate-camera guard** — folded into the camera-rig work: the higher
+  rig elevations make the `forward ∥ world_up` NaN reachable, so the `|cross|>eps`
+  guard in `world_to_camera_frame` lands with axis G (was listed standalone above).
+- ⬜ **Grid-line ground (axis D)** — replace the flat-color floor with a locally
+  generated grid-line texture (`OmniPBR(texture_path=…)` on `GroundPlane`),
+  randomized per clip, for a translation/parallax cue. Suppressed under an
+  environment USD that ships its own floor.
+
 ## P0.5 — Gating probes  ⛔ GATE A + GATE B
 
 *On Kubric MOVi-E / CLEVRER (shared GT ω/v/CoM, 4-frame RGB). Spec:

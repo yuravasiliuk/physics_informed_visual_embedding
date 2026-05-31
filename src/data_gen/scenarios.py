@@ -466,17 +466,25 @@ def build_cluttered(world, rng, config):
 
 
 # --- topple -----------------------------------------------------------------
-# Observability scenario (physics-diversification.md W3). A tall, small-
-# footprint body standing on the ground is tipped by a horizontal-axis angular
-# kick and topples onto a face. The toppling itself is the dynamic signal;
-# once W2 authors an offset CoM, *which* face it settles on becomes decided by
-# that offset — making CoM strongly observable (the R6 no-signal-in-data fix).
+# Observability scenario (physics-diversification.md W3 / W3a). A tall, small-
+# footprint body is spawned leaning *just past* its critical tip angle, so
+# GRAVITY topples it onto a face (with a small kick in the tip direction). The
+# toppling is the dynamic signal; with W2's offset CoM, *which* face it settles
+# on is decided by that offset — making CoM strongly observable (R6 fix).
+#
+# W3a: the previous version set only an angular-velocity kick on an upright
+# body. That kick (1.0-2.5 rad/s) is at/below the tipping energy barrier, so the
+# body rocked and settled back upright — the scenario looked static. Leaning
+# past theta_crit guarantees a visible topple every clip without a large kick
+# that would swamp the CoM-direction signal.
 
 TOPPLE_N_RANGE = (1, 2)                      # inclusive — keep it clean/observable
 TOPPLE_FOOTPRINT_RANGE = (0.05, 0.09)        # small base side / diameter, m
 TOPPLE_HEIGHT_RANGE = (0.25, 0.45)           # tall, m — aspect ratio ~3-9:1
-TOPPLE_TIP_ANGVEL_RANGE = (1.0, 2.5)         # rad/s about a horizontal axis
-TOPPLE_XY_RANGE = (-0.22, 0.22)
+TOPPLE_KICK_ANGVEL_RANGE = (0.3, 1.0)        # rad/s, small assist in the tip direction (gravity does the work)
+TOPPLE_LEAN_MARGIN_DEG = (3.0, 8.0)          # lean this far PAST theta_crit so it always tips
+TOPPLE_TIP_JITTER_DEG = 15.0                 # ± jitter on a cuboid's tip-over direction
+TOPPLE_XY_RANGE = (-0.30, 0.30)
 TOPPLE_GROUND_CLEARANCE = 0.005              # spawn just clear of ground (no t=0 penetration)
 TOPPLE_SHAPES = ("cuboid", "cylinder")       # only shapes with a flat base to stand on
 
@@ -499,42 +507,75 @@ def _sample_tall_dims(rng, shape):
     return (r, h)
 
 
-def _standing_half_height(shape, dims):
-    """Half the vertical extent of a body resting upright on its base."""
+def _topple_spacing_radius(shape, dims):
+    """XY spacing radius for non-overlap: base footprint + a small lean allowance.
+
+    A body tilted by ~theta_crit+margin shifts horizontally by only
+    ~half_h·sin(lean) — a few cm, NOT a full half-height. Using the half-height
+    (the original here) made two tall bodies un-placeable in the spawn box; this
+    footprint-based radius keeps them apart without over-spacing."""
     if shape == "cuboid":
-        return 0.5 * dims[2]
-    return 0.5 * dims[1]              # cylinder height
+        foot = 0.5 * float(np.hypot(dims[0], dims[1]))
+        half_h = 0.5 * dims[2]
+    else:
+        foot = dims[0]
+        half_h = 0.5 * dims[1]
+    return foot + 0.3 * half_h
 
 
-def _standing_footprint_radius(shape, dims):
-    """In-plane circumscribed radius of the base, for XY non-overlap spacing."""
-    if shape == "cuboid":
-        return 0.5 * float(np.hypot(dims[0], dims[1]))
-    return dims[0]                    # cylinder radius
+def _axis_angle_rotmat(axis, angle):
+    """Rotation matrix for a right-handed rotation `angle` about unit-ish `axis`
+    (Rodrigues). Used to place a leaning body so its lowest vertex sits on the
+    ground."""
+    axis = np.asarray(axis, dtype=np.float64)
+    axis = axis / np.linalg.norm(axis)
+    x, y, z = axis
+    K = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+    return np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * (K @ K)
 
 
-def _sample_horizontal_angvel(rng):
-    """Angular velocity about a random horizontal axis — the tip-over kick.
+def _topple_lean_pose(rng, shape, dims, center_xy):
+    """Lean a tall body just past its tip angle (W3a).
 
-    Z-component is zero: a vertical spin would not topple an upright body, so
-    all of the kick goes into rotating it about a horizontal axis through its
-    base, carrying the CoM past the support edge.
+    Returns (position_world, orientation_wxyz, ang_vel_world, lean_deg, tip_az_rad).
+    The body is tilted by theta_crit + margin about the horizontal axis ⟂ the
+    chosen tip direction φ, then raised so its lowest tilted vertex rests at
+    ground+clearance (no t=0 penetration). A small angular kick `mag·axis`
+    continues the tip toward φ.
     """
-    mag = float(rng.uniform(*TOPPLE_TIP_ANGVEL_RANGE))
-    az = rng.uniform(0.0, 2.0 * np.pi)
-    return np.array([mag * np.cos(az), mag * np.sin(az), 0.0])
+    he = body_factory.half_extents(shape, dims)          # (hx, hy, hz)
+    half_h = float(he[2])
+    if shape == "cuboid":
+        # Tip over the SHORTER base edge (smallest theta_crit) so it reliably
+        # falls; bias φ along that axis with jitter.
+        if he[0] <= he[1]:
+            d = float(he[0]); base_phi = float(rng.choice([0.0, np.pi]))
+        else:
+            d = float(he[1]); base_phi = float(rng.choice([0.5 * np.pi, 1.5 * np.pi]))
+        phi = base_phi + np.deg2rad(rng.uniform(-TOPPLE_TIP_JITTER_DEG, TOPPLE_TIP_JITTER_DEG))
+    else:                                                # cylinder: axisymmetric
+        d = float(he[0]); phi = float(rng.uniform(0.0, 2.0 * np.pi))
+
+    theta_crit = float(np.arctan2(d, half_h))
+    alpha = theta_crit + np.deg2rad(rng.uniform(*TOPPLE_LEAN_MARGIN_DEG))
+    axis = np.array([-np.sin(phi), np.cos(phi), 0.0])    # horizontal, ⟂ tip dir
+    quat = np.array([np.cos(alpha / 2.0),
+                     np.sin(alpha / 2.0) * axis[0],
+                     np.sin(alpha / 2.0) * axis[1],
+                     np.sin(alpha / 2.0) * axis[2]])      # wxyz
+    R = _axis_angle_rotmat(axis, alpha)
+    # Lowest tilted point relative to center along z = -Σ_k |R[2,k]|·he_k.
+    center_z = TOPPLE_GROUND_CLEARANCE + float(np.sum(np.abs(R[2, :]) * np.asarray(he)))
+    position = np.array([center_xy[0], center_xy[1], center_z])
+    ang_vel = float(rng.uniform(*TOPPLE_KICK_ANGVEL_RANGE)) * axis
+    return position, quat, ang_vel, float(np.rad2deg(alpha)), float(phi % (2.0 * np.pi))
 
 
-def build_topple(world, rng, config):
-    """1-2 tall bodies standing on the ground, kicked so they tip and settle."""
-    n = int(rng.integers(TOPPLE_N_RANGE[0], TOPPLE_N_RANGE[1] + 1))
-    shapes = [rng.choice(TOPPLE_SHAPES).item() for _ in range(n)]
-    dims_list = [_sample_tall_dims(rng, s) for s in shapes]
-    radii = [_standing_footprint_radius(shapes[i], dims_list[i]) for i in range(n)]
-
-    # Rejection-sample distinct XY base centers; z is pinned per body to its
-    # standing half-height, so we can't reuse sample_non_overlapping_positions
-    # (which samples z from a range).
+def _place_topple_centers(rng, radii, config):
+    """Rejection-sample distinct XY base centers (z is set later by the lean
+    pose, so we can't reuse sample_non_overlapping_positions which samples z).
+    Returns a list of (2,) arrays, or None if any body can't be placed within
+    pose_rejection_max_attempts."""
     xy_lo, xy_hi = TOPPLE_XY_RANGE
     centers = []
     for r_i in radii:
@@ -547,27 +588,53 @@ def build_topple(world, rng, config):
                 centers.append(cand)
                 break
         else:
-            raise _placement_failed("topple", n, config)
+            return None
+    return centers
+
+
+def build_topple(world, rng, config):
+    """1-2 tall bodies spawned leaning past their tip angle; gravity topples them (W3a)."""
+    n = int(rng.integers(TOPPLE_N_RANGE[0], TOPPLE_N_RANGE[1] + 1))
+    shapes = [rng.choice(TOPPLE_SHAPES).item() for _ in range(n)]
+    dims_list = [_sample_tall_dims(rng, s) for s in shapes]
+    radii = [_topple_spacing_radius(shapes[i], dims_list[i]) for i in range(n)]
+
+    # Degrade gracefully rather than hard-failing: if N bodies won't fit in the
+    # spawn box, drop one and retry (N=1 always places). Removes the placement
+    # RuntimeError on unlucky two-large-body draws.
+    centers = _place_topple_centers(rng, radii, config)
+    while centers is None and n > 1:
+        n -= 1
+        shapes, dims_list, radii = shapes[:n], dims_list[:n], radii[:n]
+        centers = _place_topple_centers(rng, radii, config)
+    if centers is None:
+        raise _placement_failed("topple", n, config)
 
     bodies, body_specs = [], []
+    initial_velocities = []
+    lean_degs, tip_azimuths = [], []
     for i in range(n):
-        half_h = _standing_half_height(shapes[i], dims_list[i])
-        pos = np.array([centers[i][0], centers[i][1], half_h + TOPPLE_GROUND_CLEARANCE])
+        pos, quat, ang_vel, lean_deg, tip_az = _topple_lean_pose(
+            rng, shapes[i], dims_list[i], centers[i],
+        )
         body, spec = body_factory.spawn_body(
-            world, rng, config, i, shapes[i], dims_list[i], pos,
+            world, rng, config, i, shapes[i], dims_list[i], pos, orientation=quat,
         )
         bodies.append(body)
         body_specs.append(spec)
+        initial_velocities.append((_zero_linear_velocity(), ang_vel))
+        lean_degs.append(lean_deg)
+        tip_azimuths.append(tip_az)
 
-    initial_velocities = [
-        (_zero_linear_velocity(), _sample_horizontal_angvel(rng)) for _ in bodies
-    ]
     scene_specs = {
         "static_assets": [],
         "scenario_specs": {
-            "tip_angvel_range": list(TOPPLE_TIP_ANGVEL_RANGE),
+            "kick_angvel_range": list(TOPPLE_KICK_ANGVEL_RANGE),
+            "lean_margin_deg": list(TOPPLE_LEAN_MARGIN_DEG),
             "footprint_range": list(TOPPLE_FOOTPRINT_RANGE),
             "height_range": list(TOPPLE_HEIGHT_RANGE),
+            "lean_deg": lean_degs,
+            "tip_azimuth_rad": tip_azimuths,
         },
     }
     return bodies, body_specs, scene_specs, initial_velocities
@@ -581,7 +648,7 @@ def build_topple(world, rng, config):
 # a relabelling of visible size.
 
 COLLIDE_HALF_SEP_RANGE = (0.30, 0.42)        # m, each body's distance from origin
-COLLIDE_SPEED_RANGE = (1.5, 3.0)             # m/s, horizontal closing speed per body
+COLLIDE_SPEED_RANGE = (1.5, 30.0)             # m/s, horizontal closing speed per body
 COLLIDE_HEIGHT_RANGE = (0.12, 0.22)          # m, shared spawn height of both centers
 COLLIDE_AIM_JITTER_DEG = 8.0                 # max ± aim jitter so it's not perfectly 1D
 

@@ -30,8 +30,20 @@ class ClipConfig:
                                                 # downsampled to this; capture stays at `resolution`
     physics_dt: float = 1.0 / 60.0            # physics step — plan §7 (60 Hz)
     render_dt: float = 1.0 / 30.0             # render step — plan §7 (30 fps)
-    camera_position: tuple = (2.2, 2.2, 1.8)  # world frame
-    camera_look_at: tuple = (0.0, 0.0, 0.1)   # world frame
+    camera_position: tuple = (2.2, 2.2, 1.8)  # world frame — single-camera fallback (verify, legacy)
+    camera_look_at: tuple = (0.0, 0.0, 0.1)   # world frame — rig look-at base too
+
+    # Multi-view capture (scene-diversification.md §10, axis G). One physics
+    # rollout is rendered from `n_cameras` jittered viewpoints on a shell around
+    # the scene centroid and fanned out into n_cameras INDEPENDENT clips (each
+    # its own folder, single-camera contract unchanged). Physics steps once.
+    n_cameras: int = 7
+    camera_radius_range: tuple = (2.8, 3.6)        # m, distance from look-at
+    camera_elevation_range: tuple = (20.0, 55.0)   # deg, base band spread across the rig
+    camera_azimuth_jitter_deg: float = 12.0        # per-camera ± on the evenly-spaced azimuth
+    camera_elevation_jitter_deg: float = 8.0       # per-camera ± on the base elevation
+    camera_elevation_clamp_deg: tuple = (12.0, 68.0)  # keep above floor / below near-top-down NaN
+    camera_lookat_jitter: float = 0.08             # m, ± per-axis jitter on the look-at point
 
     # Scene randomization
     scenarios: tuple = (
@@ -73,6 +85,14 @@ class ClipConfig:
     # enclosures (plan §5) deferred — they need external PBR assets.
     ground_color_range: tuple = (0.25, 0.55)
 
+    # Ground grid texture (scene-diversification.md §10.4, axis D). A locally
+    # generated grid-line PNG bound to the ground via OmniPBR gives a
+    # translation/parallax cue the flat colour lacks. texture_scale (UV repeats)
+    # is randomized per clip for line-spacing variety; suppressed when an
+    # environment USD ships its own floor.
+    ground_grid_enabled: bool = True
+    ground_grid_tiling_range: tuple = (6.0, 16.0)  # UV repeats across the plane
+
     # Lighting (HDRI). Empty `hdri_paths` = no-op, Isaac default lighting applies.
     # Populate with file paths or nucleus URIs to enable HDRI randomization.
     hdri_paths: tuple = ()
@@ -80,8 +100,8 @@ class ClipConfig:
     hdri_intensity: float = 1000.0
 
 
-def make_annotators(camera_position, look_at, resolution):
-    """Attach RGB, depth, normals, semantic-seg annotators to a render product.
+def make_annotators(camera_position, look_at, resolution, rp_name=None):
+    """Create one camera + render product and attach RGB/depth/normals/seg annotators.
 
     Segmentation uses `semantic_segmentation` (not `instance_segmentation_fast`)
     so prims sharing a `class` label collapse to one ID — step 5.8 of
@@ -89,6 +109,11 @@ def make_annotators(camera_position, look_at, resolution):
     own class (its body name) and all scenery shares `class=scenery`, so the
     annotator yields exactly the per-body-plus-scenery grouping the probe
     needs. `colorize=False` keeps the output as raw class IDs.
+
+    `rp_name` names the render product — required to be unique when several
+    cameras coexist (the multi-view rig, scene-diversification.md §10). Each
+    call returns an independent annotator dict bound to its own render product,
+    so `capture(annots[c])` reads only camera c's data.
     """
     camera = rep.create.camera(
         position=tuple(camera_position),
@@ -100,7 +125,10 @@ def make_annotators(camera_position, look_at, resolution):
         focus_distance=400.0,
     )
 
-    rp = rep.create.render_product(camera, tuple(resolution))
+    if rp_name is None:
+        rp = rep.create.render_product(camera, tuple(resolution))
+    else:
+        rp = rep.create.render_product(camera, tuple(resolution), name=rp_name)
     annots = {
         "rgb": rep.AnnotatorRegistry.get_annotator("rgb"),
         "depth": rep.AnnotatorRegistry.get_annotator("distance_to_camera"),
@@ -112,6 +140,49 @@ def make_annotators(camera_position, look_at, resolution):
     for a in annots.values():
         a.attach(rp)
     return annots
+
+
+def sample_camera_rig(rng, config):
+    """Sample `config.n_cameras` viewpoints on a shell around the scene centroid.
+
+    Predefined rig + per-rollout jitter (scene-diversification.md §10.2): azimuths
+    are evenly spaced (with a per-rollout global rotation so the rig isn't
+    axis-aligned every clip) and jittered; base elevations are spread across
+    `camera_elevation_range` and jittered (clamped to keep the camera above the
+    floor and clear of the near-top-down NaN); radius and look-at are jittered
+    per camera. Returns a list of (camera_pos_world, look_at_world) float arrays.
+    """
+    n = int(config.n_cameras)
+    look_base = np.asarray(config.camera_look_at, dtype=np.float64)
+    el_lo, el_hi = config.camera_elevation_range
+    base_elev = np.linspace(el_lo, el_hi, n) if n > 1 else np.array([(el_lo + el_hi) / 2.0])
+    az0 = rng.uniform(0.0, 2.0 * np.pi)
+    az_j = np.deg2rad(config.camera_azimuth_jitter_deg)
+    el_j = config.camera_elevation_jitter_deg
+    el_clamp_lo, el_clamp_hi = config.camera_elevation_clamp_deg
+
+    rig = []
+    for k in range(n):
+        az = az0 + 2.0 * np.pi * k / n + rng.uniform(-az_j, az_j)
+        el_deg = np.clip(base_elev[k] + rng.uniform(-el_j, el_j), el_clamp_lo, el_clamp_hi)
+        el = np.deg2rad(el_deg)
+        r = rng.uniform(*config.camera_radius_range)
+        look = look_base + rng.uniform(-config.camera_lookat_jitter, config.camera_lookat_jitter, size=3)
+        offset = r * np.array([
+            np.cos(el) * np.cos(az),
+            np.cos(el) * np.sin(az),
+            np.sin(el),
+        ])
+        rig.append((look + offset, look))
+    return rig
+
+
+def make_rig_annotators(rig, resolution):
+    """One independent annotator dict per rig camera (parallel to `rig`)."""
+    return [
+        make_annotators(pos, look, resolution, rp_name=f"rp_cam_{i:02d}")
+        for i, (pos, look) in enumerate(rig)
+    ]
 
 
 def capture(annots):
@@ -146,8 +217,19 @@ def world_to_camera_frame(camera_pos, look_at, world_up=(0.0, 0.0, 1.0)):
 
     forward = look_at - camera_pos
     forward /= np.linalg.norm(forward)
+    # Degenerate-camera guard (critique #12). If forward is (near-)parallel to
+    # world_up, cross(forward, world_up) ~= 0 and the basis blows up to NaN. The
+    # camera rig clamps elevation below ~68° to stay clear of this, but guard
+    # explicitly so any future top-down scenario fails loudly, not silently.
     right = np.cross(forward, world_up)
-    right /= np.linalg.norm(right)
+    right_norm = np.linalg.norm(right)
+    if right_norm < 1e-6:
+        raise ValueError(
+            "Degenerate camera: forward is parallel to world_up "
+            f"(camera_pos={camera_pos.tolist()}, look_at={look_at.tolist()}). "
+            "Tilt the view off the vertical."
+        )
+    right /= right_norm
     up = np.cross(right, forward)
 
     R_world_camera = np.stack([right, up, -forward], axis=1)
@@ -268,8 +350,19 @@ def log_state_frame(bodies, local_coms, frame_idx, records, R_camera_world, came
         })
 
 
-def build_metadata(config: ClipConfig, body_specs, scene_specs, scenario_name, R_camera_world, seed: int):
-    return {
+def build_metadata(config: ClipConfig, body_specs, scene_specs, scenario_name, R_camera_world, seed: int,
+                   camera_position_world=None, camera_look_at_world=None, multiview=None):
+    """Assemble one clip's meta.json.
+
+    `camera_position_world` / `camera_look_at_world` override the config defaults
+    so each fanned-out multi-view clip records its OWN camera pose (the rig pose,
+    not the single-camera fallback). `multiview` is the optional provenance block
+    (scene-diversification.md §8/§10) linking the n_cameras sibling clips that
+    share one physics rollout. Both default to the legacy single-camera values.
+    """
+    cam_pos = config.camera_position if camera_position_world is None else camera_position_world
+    cam_look = config.camera_look_at if camera_look_at_world is None else camera_look_at_world
+    meta = {
         "schema_version": "rigid-probe/v0-draft",
         "frame_count": config.frame_count,
         "resolution": list(config.resolution),                  # render/capture res
@@ -280,10 +373,13 @@ def build_metadata(config: ClipConfig, body_specs, scene_specs, scenario_name, R
         "scenario": scenario_name,
         "scene": scene_specs,
         "bodies": body_specs,
-        "camera_position_world": list(config.camera_position),
-        "camera_look_at_world": list(config.camera_look_at),
+        "camera_position_world": [float(x) for x in cam_pos],
+        "camera_look_at_world": [float(x) for x in cam_look],
         "R_camera_world": R_camera_world.tolist(),
     }
+    if multiview is not None:
+        meta["multiview"] = multiview
+    return meta
 
 
 def _resize_rgb(rgb, size):

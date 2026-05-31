@@ -59,6 +59,7 @@ from omni.isaac.core import World
 from omni.isaac.core.objects import GroundPlane
 from omni.isaac.core.utils.stage import create_new_stage
 
+import body_factory
 import environments
 import lighting
 import scenarios
@@ -67,9 +68,10 @@ from clip_capture import (
     build_metadata,
     capture,
     log_state_frame,
-    make_annotators,
+    make_rig_annotators,
     read_local_com,
     rotmat_to_quat_wxyz,
+    sample_camera_rig,
     save_clip,
     world_to_camera_frame,
 )
@@ -123,38 +125,58 @@ def build_scene(world: World, rng: np.random.Generator, config: ClipConfig, env_
     # requires both /Isaac and /NVIDIA under the asset root and fails on our
     # local /Isaac-only sync). For HDRI-lit scenes we don't need the textured
     # grid environment anyway.
-    if env_loaded:
-        ground_color = None
-    else:
-        ground_color = np.array(
-            rng.uniform(*config.ground_color_range, size=3), dtype=np.float32,
-        )
-        GroundPlane(
-            prim_path="/World/ground_plane", z_position=0.0, color=ground_color,
-        )
+    ground_spec = None
+    if not env_loaded:
+        if config.ground_grid_enabled:
+            # Grid-line texture (scene-diversification.md §10.4) — a translation/
+            # parallax cue the flat colour lacks. UV tiling randomized per clip.
+            grid_mat = body_factory.make_ground_grid_material(
+                "/World/Looks/ground_grid", rng, config,
+            )
+            GroundPlane(
+                prim_path="/World/ground_plane", z_position=0.0, visual_material=grid_mat,
+            )
+            ground_spec = {"grid": True}
+        else:
+            ground_color = np.array(
+                rng.uniform(*config.ground_color_range, size=3), dtype=np.float32,
+            )
+            GroundPlane(
+                prim_path="/World/ground_plane", z_position=0.0, color=ground_color,
+            )
+            ground_spec = {"color_rgb": [float(c) for c in ground_color]}
     scenario_name = rng.choice(config.scenarios).item()
     bodies, body_specs, scene_specs, initial_velocities = scenarios.build(
         scenario_name, world, rng, config,
     )
-    if ground_color is not None:
-        scene_specs["ground"] = {"color_rgb": [float(c) for c in ground_color]}
+    if ground_spec is not None:
+        scene_specs["ground"] = ground_spec
     return bodies, body_specs, scene_specs, initial_velocities, scenario_name
 
 
-def simulate_clip(world, bodies, initial_velocities, annots, config, R_camera_world, camera_pos_world, q_camera_world, collect_raw_pose=False):
-    """Run the K-frame loop, returning captured frames and per-body state records.
+def simulate_clip(world, bodies, initial_velocities, cam_annots, config, cam_extrinsics, collect_raw_pose=False):
+    """Run the K-frame loop once, capturing from N cameras simultaneously.
 
-    `initial_velocities` is a list of (lin_vel_world, ang_vel_world) numpy
-    arrays aligned with `bodies`. Velocities are applied AFTER `world.reset()`
-    because Isaac discards velocities set before reset.
+    Multi-view (scene-diversification.md §10): the physics steps ONCE per frame;
+    each frame is then captured from every camera and the per-body state is
+    logged once per camera (in that camera's frame). The N cameras observe
+    identical dynamics — the basis for the independent-clip fan-out in
+    `collect_clip`.
 
-    `collect_raw_pose` (verify-only hook): when True, also capture each body's
-    raw `get_world_pose()` per frame and return them as a 4-tuple
-    `(frames, state_records, raw_pose_world, raw_quat_world)`. This lets a
-    verification harness probe what `get_world_pose()` actually returns for an
-    offset-CoM body (prim origin vs CoM) independently of `log_state_frame`'s
-    reconstruction — see verify_physics_labels.py W4. Default False keeps the
-    production return shape `(frames, state_records)` untouched.
+    `cam_annots` is a list (length C) of annotator dicts, one per camera (from
+    `make_rig_annotators`). `cam_extrinsics` is the parallel list of
+    `(R_camera_world, camera_pos_world, q_camera_world)` tuples. A single camera
+    is just C==1 — that's how verify_physics_labels.py drives this loop.
+
+    `initial_velocities` is a list of (lin_vel_world, ang_vel_world) arrays
+    aligned with `bodies`, applied AFTER `world.reset()` (Isaac discards
+    velocities set before reset).
+
+    Returns `(cam_frames, cam_records)` — each a list of length C, where
+    `cam_frames[c]` is that camera's frame list and `cam_records[c]` its state
+    records. `collect_raw_pose=True` (verify-only) appends camera-agnostic
+    `raw_pose_world, raw_quat_world` (per-body world `get_world_pose()`), used to
+    probe origin-vs-CoM independently of the reconstruction (W4).
     """
     world.reset()
     for body, (lin_vel, ang_vel) in zip(bodies, initial_velocities):
@@ -165,20 +187,23 @@ def simulate_clip(world, bodies, initial_velocities, annots, config, R_camera_wo
     # so cache the local CoM offset once instead of re-reading USD per frame.
     local_coms = [read_local_com(body) for body in bodies]
 
-    frames = []
-    state_records = []
+    C = len(cam_annots)
+    cam_frames = [[] for _ in range(C)]
+    cam_records = [[] for _ in range(C)]
     raw_pose_world = [[] for _ in bodies] if collect_raw_pose else None
     raw_quat_world = [[] for _ in bodies] if collect_raw_pose else None
     for frame_idx in range(config.frame_count):
         world.step(render=True)
-        rep.orchestrator.step()  # flush annotator outputs for this frame
-        frames.append(capture(annots))
-        log_state_frame(
-            bodies, local_coms, frame_idx, state_records,
-            R_camera_world=R_camera_world,
-            camera_pos_world=camera_pos_world,
-            q_camera_world=q_camera_world,
-        )
+        rep.orchestrator.step()  # flush all render products for this frame
+        for c in range(C):
+            cam_frames[c].append(capture(cam_annots[c]))
+            R_camera_world, camera_pos_world, q_camera_world = cam_extrinsics[c]
+            log_state_frame(
+                bodies, local_coms, frame_idx, cam_records[c],
+                R_camera_world=R_camera_world,
+                camera_pos_world=camera_pos_world,
+                q_camera_world=q_camera_world,
+            )
         if collect_raw_pose:
             for b_i, body in enumerate(bodies):
                 p, q = body.get_world_pose()
@@ -186,8 +211,8 @@ def simulate_clip(world, bodies, initial_velocities, annots, config, R_camera_wo
                 raw_quat_world[b_i].append(np.asarray(q, dtype=np.float64))
 
     if collect_raw_pose:
-        return frames, state_records, raw_pose_world, raw_quat_world
-    return frames, state_records
+        return cam_frames, cam_records, raw_pose_world, raw_quat_world
+    return cam_frames, cam_records
 
 
 def validate_clip(frames, state_records, config: ClipConfig):
@@ -231,10 +256,14 @@ def validate_clip(frames, state_records, config: ClipConfig):
     return True, None
 
 
-def collect_clip(out_dir: str, config: ClipConfig, seed: int, env_override: str = None):
-    """End-to-end single-clip collection. Reusable from a shard-level driver.
+def collect_clip(out_dirs, config: ClipConfig, seed: int, env_override: str = None):
+    """End-to-end collection of ONE physics rollout, fanned out to N clips.
 
-    `env_override` pins the environment choice (see environments.setup_random_environment).
+    `out_dirs` is a list of `config.n_cameras` output directories — one per rig
+    camera. The physics rollout runs once; each camera's view is written to its
+    own directory as an INDEPENDENT clip (single-camera contract unchanged,
+    scene-diversification.md §10). Returns a list of `(ok, reason)` aligned with
+    `out_dirs`. `env_override` pins the environment choice.
     """
     rng = np.random.default_rng(seed)
 
@@ -266,54 +295,56 @@ def collect_clip(out_dir: str, config: ClipConfig, seed: int, env_override: str 
         scene_specs["environment"] = env_spec
     if hdri_spec is not None:
         scene_specs["hdri"] = hdri_spec
-    annots = make_annotators(config.camera_position, config.camera_look_at, config.resolution)
+    # Camera rig: N jittered viewpoints on a shell around the scene (§10.2).
+    # Each becomes its own clip; the physics rollout is shared.
+    rig = sample_camera_rig(rng, config)
+    cam_annots = make_rig_annotators(rig, config.resolution)
+    cam_extrinsics = []
+    for cam_pos, look_at in rig:
+        R_cw, cam_pos_w = world_to_camera_frame(cam_pos, look_at)
+        cam_extrinsics.append((R_cw, cam_pos_w, rotmat_to_quat_wxyz(R_cw)))
 
-    R_camera_world, camera_pos_world = world_to_camera_frame(
-        config.camera_position, config.camera_look_at,
-    )
-    q_camera_world = rotmat_to_quat_wxyz(R_camera_world)
-
-    # Persist the realized initial-velocity draw per body (critique #2). The
-    # scenario builders sample these; they are otherwise applied in
-    # simulate_clip and discarded, leaving the clip unreconstructable from
-    # meta.json (only the sampling *range* is recorded) and frame-0 state
-    # already corrupted by one gravity step + any contact impulse.
-    #
-    # Primary fields are in CAMERA frame, matching state.json's per-frame
-    # *_camera convention (R_camera_world @ v_world, the same rotation
-    # log_state_frame applies — velocities are free vectors, no translation).
-    # The raw world-frame draw is kept in parallel *_world fields: it's exactly
-    # what set_{linear,angular}_velocity received, so a replay can reapply it
-    # verbatim. initial_velocities is aligned with body_specs by spawn order.
-    for spec, (lin_vel_world, ang_vel_world) in zip(body_specs, initial_velocities):
-        lin_vel_world = np.asarray(lin_vel_world, dtype=np.float64)
-        ang_vel_world = np.asarray(ang_vel_world, dtype=np.float64)
-        spec["init_lin_vel_camera"] = (R_camera_world @ lin_vel_world).tolist()
-        spec["init_ang_vel_camera"] = (R_camera_world @ ang_vel_world).tolist()
-        spec["init_lin_vel_world"] = lin_vel_world.tolist()
-        spec["init_ang_vel_world"] = ang_vel_world.tolist()
-
-    frames, state_records = simulate_clip(
-        world, bodies, initial_velocities, annots, config,
-        R_camera_world, camera_pos_world, q_camera_world,
+    cam_frames, cam_records = simulate_clip(
+        world, bodies, initial_velocities, cam_annots, config, cam_extrinsics,
     )
 
-    # Post-reset MEASURED mass properties — the training-truth labels. PhysX
-    # only materializes mass/CoM at world.reset() (done inside simulate_clip),
-    # and both are constant thereafter, so read them back now. The measured CoM
-    # must equal the authored offset (W2 + scale fix); logging the measured
-    # value makes the label self-consistent with the physics by construction
-    # rather than trusting the authored attribute round-tripped correctly.
+    # Post-reset MEASURED mass properties — the training-truth labels, camera-
+    # agnostic. PhysX only materializes mass/CoM at world.reset() (done inside
+    # simulate_clip) and both are constant thereafter, so read them back now. The
+    # measured CoM must equal the authored offset (W2 + scale fix); logging the
+    # measured value makes the label self-consistent with the physics.
     for spec, body in zip(body_specs, bodies):
         spec["com_local_measured"] = read_local_com(body).tolist()
         spec["mass_measured"] = float(body.get_mass())
 
-    ok, reason = validate_clip(frames, state_records, config)
+    # Fan out: one independent clip per camera. body_specs is shared except the
+    # camera-frame initial-velocity projection (critique #2), which is recomputed
+    # per camera; the *_world fields are identical across siblings.
+    results = []
+    C = len(rig)
+    for c in range(C):
+        R_cw, cam_pos_w, _ = cam_extrinsics[c]
+        specs_c = [dict(s) for s in body_specs]
+        for spec, (lin_vel_world, ang_vel_world) in zip(specs_c, initial_velocities):
+            lin_vel_world = np.asarray(lin_vel_world, dtype=np.float64)
+            ang_vel_world = np.asarray(ang_vel_world, dtype=np.float64)
+            spec["init_lin_vel_camera"] = (R_cw @ lin_vel_world).tolist()
+            spec["init_ang_vel_camera"] = (R_cw @ ang_vel_world).tolist()
+            spec["init_lin_vel_world"] = lin_vel_world.tolist()
+            spec["init_ang_vel_world"] = ang_vel_world.tolist()
 
-    meta = build_metadata(config, body_specs, scene_specs, scenario_name, R_camera_world, seed)
-    meta["validation"] = {"ok": ok, "reason": reason}
-    save_clip(out_dir, frames, state_records, meta, save_resolution=config.save_resolution)
-    return ok, reason
+        ok, reason = validate_clip(cam_frames[c], cam_records[c], config)
+        meta = build_metadata(
+            config, specs_c, scene_specs, scenario_name, R_cw, seed,
+            camera_position_world=[float(x) for x in rig[c][0]],
+            camera_look_at_world=[float(x) for x in rig[c][1]],
+            multiview={"rollout_seed": seed, "camera_index": c, "n_cameras": C},
+        )
+        meta["validation"] = {"ok": ok, "reason": reason}
+        save_clip(out_dirs[c], cam_frames[c], cam_records[c], meta,
+                  save_resolution=config.save_resolution)
+        results.append((ok, reason))
+    return results
 
 
 def main():
@@ -327,30 +358,33 @@ def main():
         config = dataclasses.replace(config, scenarios=(args.scenario,))
 
     base_out = os.path.abspath(args.result)
+    C = config.n_cameras
     n_ok = 0
+    n_total = 0
+    global_idx = 0    # running clip index across all (rollout, camera) pairs
     for i in range(args.n_clips):
-        # Isolate between clips: World is a singleton with cached physics
-        # views, and the USD stage retains every prim from the prior clip.
+        # Isolate between rollouts: World is a singleton with cached physics
+        # views, and the USD stage retains every prim from the prior rollout.
         # Clearing both gives the next collect_clip() a clean slate without
         # re-booting SimulationApp.
         if i > 0:
             World.clear_instance()
             create_new_stage()
 
-        if args.n_clips == 1:
-            out_dir = base_out
-        else:
-            out_dir = os.path.join(base_out, f"clip_{i:04d}")
-
+        # Each physics rollout fans out into C independent sibling clips
+        # (one per rig camera), written as flat clip_NNNNN dirs.
+        out_dirs = [os.path.join(base_out, f"clip_{global_idx + c:05d}") for c in range(C)]
         seed = args.seed + i
-        ok, reason = collect_clip(
-            out_dir, config, seed, env_override=args.environment,
-        )
-        n_ok += int(ok)
-        print(f"[clip {i + 1}/{args.n_clips}] seed={seed} ok={ok} reason={reason}")
+        results = collect_clip(out_dirs, config, seed, env_override=args.environment)
+        for c, (ok, reason) in enumerate(results):
+            n_total += 1
+            n_ok += int(ok)
+            print(f"[rollout {i + 1}/{args.n_clips} cam {c}] "
+                  f"-> {os.path.basename(out_dirs[c])} seed={seed} ok={ok} reason={reason}")
+        global_idx += C
 
-    if args.n_clips > 1:
-        print(f"summary: {n_ok}/{args.n_clips} clips validated")
+    print(f"summary: {n_ok}/{n_total} clips validated "
+          f"({args.n_clips} rollouts x {C} cameras)")
     simulation_app.close()
 
 

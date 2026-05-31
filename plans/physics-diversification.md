@@ -85,13 +85,37 @@ only; not yet run under Isaac.*
   body. W4 settles it; until then the `pos + R·com_local` reconstruction is
   unverified for the non-zero case.
 
-### W3 — Observability scenarios ✅ DONE
+### W3 — Observability scenarios ✅ DONE (topple fix in W3a)
 *Fixes the R6 no-signal-in-data half. New builders in `scenarios.py` + registry.*
 *Implemented: `build_topple` + `build_collide`, registered in `BUILDERS` and
 `ClipConfig.scenarios`; per-scenario `observability_hint` tag injected in
 `scenarios.build`. Per-body construction refactored into `body_factory.spawn_body`
 (shared with `build_random_bodies`, RNG order preserved). `topple`'s CoM-face
 signal is dormant until W2. Compile-checked only — not yet run under Isaac.*
+
+#### W3a — `topple` produces near-zero motion (energy-barrier bug) ⬜ TO IMPLEMENT
+*Found on inspection 2026-05-30: the `topple` scenario looks static.* The tip
+kick `TOPPLE_TIP_ANGVEL_RANGE = (1.0, 2.5)` rad/s is **at or below the tipping
+energy barrier**. For a typical tall body (footprint half ≈0.035 m, height half
+≈0.175 m) the critical tilt is θ_crit ≈ 11°, so the CoM must rise Δh ≈ 3.5 mm to
+clear the support edge — barrier ≈ `m·g·Δh ≈ 0.034·m` J. The kick supplies only
+`½·I·ω² ≈ 0.005·m` at ω=1.0 and `≈0.032·m` at ω=2.5 — under the barrier — so the
+body rocks and settles back upright instead of toppling.
+
+**Fix (decided with user): lean + small kick.** Spawn each topple body already
+tilted *just past* its critical angle so **gravity** does the toppling
+(guaranteed visible every clip), with a small angular kick in the tip direction:
+
+- Add an `orientation` (wxyz quaternion) parameter to `body_factory.make_body`
+  and `spawn_body` (Isaac `Dynamic*` constructors already accept `orientation`).
+- In `build_topple`: sample a tip azimuth φ; lean angle = θ_crit + margin (≈5°)
+  about the horizontal axis ⟂ to the tip direction `(−sinφ, cosφ, 0)`. Place the
+  body so its **lowest tilted vertex sits at ground+clearance** (shift center up
+  by `Σ_k |R[2,k]|·half_extent_k`) — no t=0 penetration, no float. Apply a small
+  angular kick `ω = mag·(−sinφ, cosφ, 0)` (continues the tip toward φ).
+- With the authored offset CoM (W2), gravity-driven toppling lets the offset
+  bias *which* face it lands on without the kick swamping the CoM signal.
+- Log `lean_deg`, `tip_azimuth_rad` in `scenario_specs`.
 
 - **`topple`** — a tall body (high aspect-ratio cuboid/cylinder) spawned upright or
   marginally stable; it tips and settles onto a face. With an authored offset CoM,
@@ -120,12 +144,12 @@ physics warmup). Run results & what they caught:*
   it returns the prim origin → the `log_state_frame` reconstruction is correct,
   no double-count** (CoM world-xy is dead constant under spin).*
 - *`two_body` ✅ — body-index ↔ label alignment holds.*
-- *`spin_cuboid` ⚠️ — ang_vel logging perfect (pure +Z, exact direction) and
-  quat composition correct, but caught **PhysX's default ~0.05 angular damping**
-  (ω decayed ~1.7%/clip; linear damping was 0). Fixed: `zero_damping` on every
-  dynamic body — controlled physics (gravity + initial v + contact only),
-  conserves angular momentum through the `collide` mass signal. Re-run: ω pinned
-  at 4.0, `angvel_camera_max_err` 0.0726 → 2.4e-5, pass.*
+- *`spin_cuboid` ✅ — ang_vel logging perfect (pure +Z, exact direction) and
+  quat composition correct. Before the fix it caught **PhysX's default ~0.05
+  angular damping** (ω decayed ~1.7%/clip; linear damping was 0). Fixed:
+  `zero_damping` on every dynamic body — controlled physics (gravity + initial v
+  + contact only), conserves angular momentum through the `collide` mass signal.
+  Re-run: ω pinned at 4.0, `angvel_camera_max_err` 0.0726 → 2.4e-5, **pass**.*
 
 *Inertia is no longer authored (PhysX computes it; scale-correct). The
 Monte-Carlo-validated `inertia_diagonal` is retained for reference only.*

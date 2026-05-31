@@ -10,6 +10,9 @@ that the body-spawning helpers do. All randomness comes from the caller-
 supplied `numpy.random.Generator`.
 """
 import colorsys
+import os
+
+import cv2
 import numpy as np
 
 import omni.usd
@@ -237,26 +240,31 @@ def sample_non_overlapping_positions(
     return positions
 
 
-def make_body(world, prim_path, name, shape, dims, position, color):
-    """Spawn one dynamic primitive of the requested shape."""
+def make_body(world, prim_path, name, shape, dims, position, color, orientation=None):
+    """Spawn one dynamic primitive of the requested shape.
+
+    `orientation` is an optional spawn orientation as a wxyz quaternion (Isaac's
+    `Dynamic*` convention). Used by `topple` to spawn a body leaning just past
+    its tip angle (physics-diversification.md W3a); None = axis-aligned.
+    """
     if shape == "cuboid":
         return world.scene.add(DynamicCuboid(
-            prim_path=prim_path, name=name, position=position,
+            prim_path=prim_path, name=name, position=position, orientation=orientation,
             scale=list(dims), color=color,
         ))
     if shape == "sphere":
         return world.scene.add(DynamicSphere(
-            prim_path=prim_path, name=name, position=position,
+            prim_path=prim_path, name=name, position=position, orientation=orientation,
             radius=dims[0], color=color,
         ))
     if shape == "cylinder":
         return world.scene.add(DynamicCylinder(
-            prim_path=prim_path, name=name, position=position,
+            prim_path=prim_path, name=name, position=position, orientation=orientation,
             radius=dims[0], height=dims[1], color=color,
         ))
     if shape == "capsule":
         return world.scene.add(DynamicCapsule(
-            prim_path=prim_path, name=name, position=position,
+            prim_path=prim_path, name=name, position=position, orientation=orientation,
             radius=dims[0], height=dims[1], color=color,
         ))
     raise ValueError(f"Unknown shape: {shape}")
@@ -285,6 +293,48 @@ def attach_pbr_material(body, prim_path, color, roughness, metallic):
     body.apply_visual_material(mat)
 
 
+GRID_TEXTURE_CACHE = os.path.expanduser("~/.cache/sim_physics/grid_texture.png")
+
+
+def ensure_grid_texture(path=GRID_TEXTURE_CACHE, size=1024, cells=8, line_frac=0.04):
+    """Generate (once, then cache) a grid-line texture PNG and return its path.
+
+    Light background with darker ruled lines (scene-diversification.md §10.4).
+    Generated locally so the ground has a translation/parallax cue without the
+    asset-server dependency of Isaac's shipped grid floor. The visible grid
+    *density* is set per clip by OmniPBR texture_scale (UV tiling), so one cached
+    texture serves all clips; only the tiling/tint vary.
+    """
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    img = np.full((size, size, 3), 210, dtype=np.uint8)      # light grey field
+    step = size // cells
+    half = max(1, int(step * line_frac))
+    for k in range(0, size + 1, step):
+        lo, hi = max(0, k - half), min(size, k + half)
+        img[lo:hi, :] = 70                                    # horizontal rules
+        img[:, lo:hi] = 70                                    # vertical rules
+    cv2.imwrite(path, img)
+    return path
+
+
+def make_ground_grid_material(prim_path, rng, config, texture_path=None):
+    """Build an OmniPBR grid material for the ground (returns the material).
+
+    Bound to the GroundPlane via `GroundPlane(visual_material=...)`. The UV
+    tiling (apparent line spacing) is randomized per clip from
+    `config.ground_grid_tiling_range`; the cached grid PNG supplies the pattern.
+    """
+    texture_path = texture_path or ensure_grid_texture()
+    tiling = float(rng.uniform(*config.ground_grid_tiling_range))
+    return OmniPBR(
+        prim_path=prim_path,
+        texture_path=texture_path,
+        texture_scale=np.array([tiling, tiling], dtype=np.float32),
+    )
+
+
 def _sample_roughness_metallic(rng, config):
     """Sample (roughness, metallic) per plan §5 Tier 3.
 
@@ -300,7 +350,7 @@ def _sample_roughness_metallic(rng, config):
     return roughness, metallic
 
 
-def spawn_body(world, rng, config, i, shape, dims, position, color=None):
+def spawn_body(world, rng, config, i, shape, dims, position, color=None, orientation=None):
     """Spawn one fully-decorated dynamic primitive; return (body, spec).
 
     The shared per-body construction used by `build_random_bodies` (which
@@ -311,8 +361,9 @@ def spawn_body(world, rng, config, i, shape, dims, position, color=None):
     one place and not the other.
 
     `i` is the body index; name/prim_path/id are derived from it to match the
-    existing convention. `color` is sampled if None. RNG draw order is
-    color -> density -> friction(s) -> restitution -> roughness/metallic,
+    existing convention. `color` is sampled if None. `orientation` is an
+    optional wxyz spawn quaternion (used by `topple`'s lean, W3a). RNG draw
+    order is color -> density -> friction(s) -> restitution -> roughness/metallic,
     matching the original inline loop exactly.
     """
     stage = omni.usd.get_context().get_stage()
@@ -324,7 +375,7 @@ def spawn_body(world, rng, config, i, shape, dims, position, color=None):
         )
     body = make_body(
         world, prim_path=prim_path, name=name,
-        shape=shape, dims=dims, position=position, color=color,
+        shape=shape, dims=dims, position=position, color=color, orientation=orientation,
     )
     prim = stage.GetPrimAtPath(prim_path)
     # W1: decouple mass from visible volume via a per-body density (PhysX
@@ -378,6 +429,9 @@ def spawn_body(world, rng, config, i, shape, dims, position, color=None):
         "mass": mass,
         "com_local_authored": [float(x) for x in com_local],
         "init_position_world": [float(x) for x in position],
+        "init_orientation_world": (
+            None if orientation is None else [float(x) for x in orientation]
+        ),
     }
     return body, spec
 

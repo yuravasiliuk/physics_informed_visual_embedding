@@ -1,0 +1,10 @@
+
+
+ROLL_RAMP_LENGTH = 0.6
+ROLL_RAMP_WIDTH = 0.6
+ROLL_ANGLE_RANGE_DEG = (15.0, 30.0)
+ROLL_SPAWN_XY_RANGE = (-0.2, 0.2)
+ROLL_SPAWN_HEIGHT_RANGE = (0.6, 1.0)
+
+THROW_SPEED_RANGE = (0.5, 12.0)        # m/s, horizontal magnitude
+THROW_UP_RANGE = (0.0, 10.5)       
