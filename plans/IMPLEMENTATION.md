@@ -27,7 +27,7 @@ F config, sim-only physics heads, translated pairs, and ablations layer on top.
 **Phase 0 (single-clip data-gen pipeline) — code written, not yet validated end-to-end.**
 Next action: run `collect_clip.py` under the Isaac Sim Python env and confirm all
 outputs are sane (see P0.4) — the validation procedure is in
-[data-gen-testing.md](data-gen-testing.md). Nothing downstream is started, and
+[data-gen-testing.md](data-gen/data-gen-testing.md). Nothing downstream is started, and
 **no model work is committed until the Phase-0.5 feasibility probe passes** (see
 the gate below).
 
@@ -49,8 +49,8 @@ the gate below).
 
 ## P0 — Single-clip data-gen pipeline (Isaac Sim)
 
-*Spec: [synthetic-data-collection.md](synthetic-data-collection.md),
-[probe-dataset.md](probe-dataset.md). Code: [../src/data_gen/](../src/data_gen/).*
+*Spec: [synthetic-data-collection.md](data-gen/synthetic-data-collection.md),
+[probe-dataset.md](data-gen/probe-dataset.md). Code: [../src/data_gen/](../src/data_gen/).*
 
 - ✅ `collect_clip.py` refactored into reusable `collect_clip(out_dir, ClipConfig, seed)`
   with `build_scene / simulate_clip / validate_clip` stages.
@@ -61,7 +61,7 @@ the gate below).
   (W4) adds spin-cuboid (ω sign/scale + quat composition), authored-offset-CoM,
   and two-body index-swap cases, all at the production camera; 3/3 pass. Caught
   and fixed two real label bugs (unscaled `centerOfMass`, default angular
-  damping). See [physics-diversification.md](physics-diversification.md) W4.
+  damping). See [physics-diversification.md](data-gen/physics-diversification.md) W4.
 - ⬜ **P0.4 — Run `collect_clip.py` end-to-end** under the Isaac Sim Python env;
   confirm the storage-optimized output contract is sane. `save_clip` writes
   **quantized, compressed `.npz`** — not raw `.npy`:
@@ -70,14 +70,14 @@ the gate below).
   (uint8, fixed [-1,1] map), `seg.npz` (uint8, or uint16 if >255 classes),
   `state.json`, `meta.json`, and optional `seg_id_to_class.json` (id→class map).
   This lands the **precision/format** disk wins from
-  [data_gen_critique0_analysis.md](data_gen_critique0_analysis.md) (#6 seg downcast,
+  [data_gen_critique0_analysis.md](critique/data_gen_critique0_analysis.md) (#6 seg downcast,
   normals→uint8, depth→uint16, `.npz` compression). The **§14 resolution-decoupling**
   knob (`save_resolution`) exists but defaults to full render res (1024²) — *not yet
   engaged*, so the biggest disk lever is still on the table (see hardening below).
   *First action for a new contributor.*
 
 **P0 hardening — critique 0** (*tracked in
-[data_gen_critique0_analysis.md](data_gen_critique0_analysis.md). Density and
+[data_gen_critique0_analysis.md](critique/data_gen_critique0_analysis.md). Density and
 resolution change dynamics/pixels and **cannot be retrofitted** — decide these
 before any scale generation; the rest are rewrite-and-rerun.*):
 
@@ -131,8 +131,8 @@ before any scale generation; the rest are rewrite-and-rerun.*):
 
 **Scene-diversity v0.2 — found on inspection 2026-05-30** (*next implementation
 batch; one Isaac smoke cycle. Specs:
-[scene-diversification.md §10](scene-diversification.md) +
-[physics-diversification.md W3a](physics-diversification.md). Change dynamics
+[scene-diversification.md §10](data-gen/scene-diversification.md) +
+[physics-diversification.md W3a](data-gen/physics-diversification.md). Change dynamics
 (topple) and pixels/viewpoint (camera, ground) → settle before the P1 batch.*):
 
 - ⬜ **W3a `topple` energy-barrier fix** — the tip kick is below the tipping
@@ -170,8 +170,8 @@ batch; one Isaac smoke cycle. Specs:
 
 ## P1 — Synthetic data at scale
 
-*Spec: [synthetic-data-collection.md §Implementation order](synthetic-data-collection.md#implementation-order),
-[scene-diversification.md](scene-diversification.md), [isaac-asset-diversification.md](isaac-asset-diversification.md).*
+*Spec: [synthetic-data-collection.md §Implementation order](data-gen/synthetic-data-collection.md#implementation-order),
+[scene-diversification.md](data-gen/scene-diversification.md), [isaac-asset-diversification.md](data-gen/isaac-asset-diversification.md).*
 
 > **Non-retrofittable dynamics decisions resolved** (W1 density, W2 offset CoM,
 > W3 observability scenarios — all change dynamics and are landed + W4-verified).
@@ -191,7 +191,7 @@ batch; one Isaac smoke cycle. Specs:
 ## P2 — Encoder + B-config heads (frozen-first)  ⛔ shape set by GATE B
 
 *Spec: [README §Baseline Step 2](../README.md#baseline-to-implement-this-milestone),
-[BRAINSTORM §2](BRAINSTORM.md#2-architecture), [training-data.md §Architecture](training-data.md#architecture--temporal-modeling).*
+[BRAINSTORM §2](BRAINSTORM.md#2-architecture), [training-data.md §Architecture](theory/training-data.md#architecture--temporal-modeling).*
 
 - ⬜ Frozen **V-JEPA 2** backbone wrapper with intermediate-block taps (which blocks ← GATE B).
 - ⬜ **Multi-layer nonlinear head** over intermediate features (DPT-style decoder) for
@@ -202,7 +202,7 @@ batch; one Isaac smoke cycle. Specs:
 
 ## P3 — Training loop
 
-*Spec: [domain-marginalization-regularizer.md](domain-marginalization-regularizer.md),
+*Spec: [domain-marginalization-regularizer.md](theory/domain-marginalization-regularizer.md),
 [README §Baseline Step 3](../README.md#baseline-to-implement-this-milestone).*
 
 - ⬜ Mixed sim + real batches **from the start** (acceptable stand-in: held-out
@@ -214,7 +214,7 @@ batch; one Isaac smoke cycle. Specs:
 
 ## P4 — B-vs-F experimental loop
 
-*Spec: [training-data.md](training-data.md), [observability-weighted-loss.md](observability-weighted-loss.md),
+*Spec: [training-data.md](theory/training-data.md), [observability-weighted-loss.md](theory/observability-weighted-loss.md),
 [README §Baseline Step 4](../README.md#baseline-to-implement-this-milestone).*
 
 - ⬜ Branch **F config**: add sim-only heads (CoM offset, ω, v, contact), **per-object**
@@ -243,9 +243,9 @@ batch; one Isaac smoke cycle. Specs:
   layer, gated by a registration / label-consistency check; treated as a third domain
   (R4/R5/R10). After regularizer A+C are stable. [BRAINSTORM §5](BRAINSTORM.md#5-simreal-domain-gap-strategy).
 - **Jacobian-column-space regularizer** (the version the transfer theorem is about) —
-  after DANN+CORAL are stable. [domain-marginalization-regularizer.md](domain-marginalization-regularizer.md).
+  after DANN+CORAL are stable. [domain-marginalization-regularizer.md](theory/domain-marginalization-regularizer.md).
 - **Physics-latent-dynamics ladder** (Neural-ODE / equivalence-class probe) — separate
-  diagnostic track, Path A vs B undecided. [physics-latent-ladder.md](physics-latent-ladder.md).
+  diagnostic track, Path A vs B undecided. [physics-latent-ladder.md](theory/physics-latent-ladder.md).
 
 ## Open decisions blocking specific items
 

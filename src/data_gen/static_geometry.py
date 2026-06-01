@@ -1,6 +1,6 @@
 """Static scene scaffolding (kinematic colliders).
 
-Step 5.1 of `plans/scene-diversification.md`. Pure-primitive helpers for ramps,
+Step 5.1 of `plans/data-gen/scene-diversification.md`. Pure-primitive helpers for ramps,
 walls, platforms, and open boxes — used by scenario builders to give bodies
 something to interact with beyond the ground plane.
 

@@ -2,9 +2,9 @@
 
 *Date: 2026-05-30. The data-gen fidelity pass that must land **before** any scale
 generation (P1) and before the feasibility/architecture gates lean on physics
-labels. Companion to [data_gen_critique0_analysis.md](data_gen_critique0_analysis.md)
-(#4, #7) and [observability-weighted-loss.md](observability-weighted-loss.md)
-(R6). Tracked operationally in [IMPLEMENTATION.md](IMPLEMENTATION.md) P0 hardening.*
+labels. Companion to [data_gen_critique0_analysis.md](../critique/data_gen_critique0_analysis.md)
+(#4, #7) and [observability-weighted-loss.md](../theory/observability-weighted-loss.md)
+(R6). Tracked operationally in [IMPLEMENTATION.md](../IMPLEMENTATION.md) P0 hardening.*
 
 ## The confound this fixes
 

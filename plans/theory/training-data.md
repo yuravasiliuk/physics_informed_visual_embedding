@@ -8,7 +8,7 @@ Companion to [theoretical-paper-plan.md](theoretical-paper-plan.md). This docume
 
 ## Label availability by head
 
-The architecture from [../Physics informed embedding.pdf](../Physics%20informed%20embedding.pdf) has heads that split cleanly by data domain:
+The architecture from [../Physics informed embedding.pdf](../../Physics%20informed%20embedding.pdf) has heads that split cleanly by data domain:
 
 | Head | Real-data label source | Sim label source |
 |---|---|---|
@@ -33,7 +33,7 @@ The encoder operates on **K-frame clips**, not single frames. ω, v, and the tim
 > parameters never see raw pixels, so sim→real stability holds by construction. The
 > raw-pixel conv branch + cross-attention below is an **escape hatch**, entered only
 > if a layer-wise probe finds no recoverable physics signal in the frozen encoder at
-> any depth. See [BRAINSTORM.md §2](BRAINSTORM.md#2-architecture). The **B/F split
+> any depth. See [BRAINSTORM.md §2](../BRAINSTORM.md#2-architecture). The **B/F split
 > is orthogonal to this** — it selects *head sets* (B = dense only; F = + physics),
 > not the backbone, and survives either choice.
 
@@ -67,14 +67,14 @@ All targets are in **camera frame** to avoid needing pose on real data and to ma
 
 Static walls still contribute `ω=v=0` (useful "rigid + still" negatives) and contact when pushed.
 
-**Contact-force loss weighting.** Contact labels are non-zero only when bodies are in contact, so per-batch sparsity is high. Apply a γ-multiplier on the contacting-body loss term (cf. RoboScape γ=5, [../summaries/roboscape.md](../summaries/roboscape.md)) or the head collapses to "always predict zero."
+**Contact-force loss weighting.** Contact labels are non-zero only when bodies are in contact, so per-batch sparsity is high. Apply a γ-multiplier on the contacting-body loss term (cf. RoboScape γ=5, [../summaries/roboscape.md](../../summaries/roboscape.md)) or the head collapses to "always predict zero."
 
 ## Real-data candidates
 
 Pick by downstream domain. Cross-domain mixing is allowed and probably desirable for the encoder's generalization.
 
 ### Robotic manipulation (matches RoboScape / Cosmos Policy stack)
-- **AgiBot-World-Beta** — ~194k episodes; used by [RoboScape](../summaries/roboscape.md) and [Cosmos Policy](../summaries/cosmos-policy.md). Default match if downstream is manipulation.
+- **AgiBot-World-Beta** — ~194k episodes; used by [RoboScape](../../summaries/roboscape.md) and [Cosmos Policy](../../summaries/cosmos-policy.md). Default match if downstream is manipulation.
 - **DROID** — ~76k Franka trajectories, in-the-wild.
 - **Open X-Embodiment** — aggregate of ~22 robots, ~1M trajectories.
 - **BridgeData V2** — 60k+ demos, some RGB-D.
@@ -87,7 +87,7 @@ Strong for depth + normals supervision; weak for dynamics (mostly static).
 
 ### Egocentric / scaled video (weak labels, strong generalization)
 - **Ego4D**, **EpicKitchens**.
-- **SAYCam** — the corpus used by V-JEPA in the [intuitive-physics opinion paper](../summaries/opinion-intuitive-physics.md). Useful as an apples-to-apples comparison point.
+- **SAYCam** — the corpus used by V-JEPA in the [intuitive-physics opinion paper](../../summaries/opinion-intuitive-physics.md). Useful as an apples-to-apples comparison point.
 
 ### Driving (optional, only if domain matters later)
 - nuScenes, Waymo Open.
@@ -112,7 +112,7 @@ Use for evaluation or as a quick smoke-test of the training pipeline.
 - **Physion / Physion++** — 8 physics scenarios, pre-rendered.
 - **CLEVRER, CATER** — synthetic with full ground-truth state.
 - **Kubric MOVi-{A..F}** — ready datasets at increasing complexity.
-- **The PhysX + Isaac Sim 800-clip evaluation set from Cosmos-Predict1 Sec 5.3** — free-fall, slopes, stable/unstable stacks, dominoes, seesaw, gyroscope (see [cosmos-predict1.md](../summaries/cosmos-predict1.md)).
+- **The PhysX + Isaac Sim 800-clip evaluation set from Cosmos-Predict1 Sec 5.3** — free-fall, slopes, stable/unstable stacks, dominoes, seesaw, gyroscope (see [cosmos-predict1.md](../../summaries/cosmos-predict1.md)).
 
 ### Recommended starting stack
 
@@ -127,7 +127,7 @@ Use for evaluation or as a quick smoke-test of the training pipeline.
    - Manipulation → Isaac Lab or MuJoCo with a Franka/UR5/AgiBot URDF.
 2. **Appearance bridging strategy.** Three options, mutually exclusive at first pass:
    - **A.** Sim as-is + heavy domain randomization. Cheapest; tests the brainstorm's actual hypothesis (encoder bridges appearance gap).
-   - **B.** Sim translated to real-looking via [Cosmos-Transfer2.5](../summaries/cosmos-predict2.5.md). Reduces appearance gap before training; partially co-opts the competing paradigm.
+   - **B.** Sim translated to real-looking via [Cosmos-Transfer2.5](../../summaries/cosmos-predict2.5.md). Reduces appearance gap before training; partially co-opts the competing paradigm.
    - **C.** Hybrid: train on (sim raw + sim translated + real), let the encoder choose what's domain-invariant.
    - Defaults to **A** because it makes the experimental claim cleanest.
 3. **Pseudo-labels on real data: how much to trust?** Video Depth Anything and SAM2 are themselves models with biases — if both real and sim sim+real heads are supervised from pseudo-labels on the real side, we're partly distilling pretrained-perception biases rather than learning from data. Options:
@@ -155,8 +155,8 @@ Three possible outcomes for B vs F:
 
 Optional further variants worth running once B and F are clean:
 
-- **F − one head** — leave-one-out ablations on CoM, ω, v, contact to identify which sim-only head carries the signal. RoboScape's analogous ablation found that keypoint-dynamics carried action-conditioning while depth was nearly flat ([../summaries/roboscape.md](../summaries/roboscape.md) Table 2); same kind of structure may show up here.
-- **A — pretrained V-JEPA 2 untouched** (no auxiliary heads at all) as the floor of the comparison — the recipe the [opinion paper](../summaries/opinion-intuitive-physics.md) argues is insufficient.
+- **F − one head** — leave-one-out ablations on CoM, ω, v, contact to identify which sim-only head carries the signal. RoboScape's analogous ablation found that keypoint-dynamics carried action-conditioning while depth was nearly flat ([../summaries/roboscape.md](../../summaries/roboscape.md) Table 2); same kind of structure may show up here.
+- **A — pretrained V-JEPA 2 untouched** (no auxiliary heads at all) as the floor of the comparison — the recipe the [opinion paper](../../summaries/opinion-intuitive-physics.md) argues is insufficient.
 - **F without translated sim** (raw sim + real only) to isolate the contribution of Cosmos-Transfer2.5 appearance bridging.
 
 ## Pipeline sketch (to be expanded once §1–§4 above are answered)
@@ -187,6 +187,6 @@ Train: per-head losses, mixed batches (sim+real on shared heads, sim-only on phy
 - Eval (held out): Physion++ for passive physics, IntPhys 2 for violations-of-expectation, RoboCasa or LIBERO if downstream is manipulation.
 
 ## What this plan does *not* yet specify
-- Per-head loss weighting and the diffusion noise schedule for scalar heads (cf. [Cosmos Policy](../summaries/cosmos-policy.md) Appx A.2.1: log-normal `σ` schedule needs adjustment for scalar targets, and [DreamerV3](../summaries/dreamer-v3.md)'s symlog/symexp for wide-dynamic-range quantities).
+- Per-head loss weighting and the diffusion noise schedule for scalar heads (cf. [Cosmos Policy](../../summaries/cosmos-policy.md) Appx A.2.1: log-normal `σ` schedule needs adjustment for scalar targets, and [DreamerV3](../../summaries/dreamer-v3.md)'s symlog/symexp for wide-dynamic-range quantities).
 - Tokenization choice (per-frame ViT patches vs MAGVIT-2 video tokens vs WAN2.1 latents).
 - Eval protocol (covered separately once benchmarks are committed).

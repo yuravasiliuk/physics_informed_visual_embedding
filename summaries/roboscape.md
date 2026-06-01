@@ -13,7 +13,7 @@ A **keypoint-guided attention mask** boosts the cross-entropy weight on active-k
 Trained on 50k AgiBotWorld-Beta clips → ~6.5 M 16-frame windows; 5 epochs × 32 A800-80GB. Beats IRASim, iVideoGPT, Genie, CogVideoX on appearance fidelity (LPIPS 0.126, PSNR 21.85), geometric accuracy (AbsRel 0.36, δ₁ 0.62, δ₂ 0.83) and action controllability (ΔPSNR 3.34).
 
 ## Why it's in the reading pile — directly maps to the brainstorm
-This is the **closest concrete instantiation** of the brainstorm's idea in the literature, and the parallel is tight enough that the new theoretical paper ([plan](../plans/theoretical-paper-plan.md)) needs to position against it explicitly.
+This is the **closest concrete instantiation** of the brainstorm's idea in the literature, and the parallel is tight enough that the new theoretical paper ([plan](../plans/theory/theoretical-paper-plan.md)) needs to position against it explicitly.
 
 | RoboScape                                              | Brainstorm's physics-informed embedding         |
 |--------------------------------------------------------|--------------------------------------------------|
@@ -37,7 +37,7 @@ So RoboScape is the **same-shape architecture serving a different end product** 
 ## What RoboScape does NOT do (gaps the brainstorm can claim)
 1. **No simulator labels.** Depth comes from Video Depth Anything (a pretrained network), not from a renderer. So the depth labels carry the *bias* of the pretrained model, not the ground-truth structure of a simulator. The brainstorm replaces this with truly physical labels.
 2. **No truly physical quantities.** Depth is geometry; keypoint consistency is a soft surrogate for material. The brainstorm's CoM, ω, contact forces are *forces and dynamics*, not derivable from any pretrained perception model.
-3. **No domain-asymmetric supervision.** All labels available on all training data. The brainstorm's hardest design point (sim-only heads + the domain-marginalization regularizer in [the plan](../plans/theoretical-paper-plan.md) §2) is untouched here.
+3. **No domain-asymmetric supervision.** All labels available on all training data. The brainstorm's hardest design point (sim-only heads + the domain-marginalization regularizer in [the plan](../plans/theory/theoretical-paper-plan.md) §2) is untouched here.
 4. **No equivariance.** Keypoint consistency is a coordinate-space alignment, not a group-equivariant constraint. Plan §3 still applies.
 5. **No counterfactual / differential supervision** (plan §4) — RoboScape is supervised on observed videos only, no per-parameter perturbations.
 6. **No conservation laws** (plan §5) — keypoint consistency is not the same as momentum or energy conservation; it's an L2 token alignment.

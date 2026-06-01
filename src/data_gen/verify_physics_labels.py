@@ -1,6 +1,6 @@
 """Closed-form correctness checks for the risky physics-label code paths.
 
-W4 of `plans/physics-diversification.md` (critique #4 / #11). The original
+W4 of `plans/data-gen/physics-diversification.md` (critique #4 / #11). The original
 `verify_collect_clip.py` only exercises a single CoM=0 sphere in free flight,
 so it never touches the label code that W2 (authored offset CoM) and W3
 (spin / collision) now lean on. This sibling adds four closed-form cases, all

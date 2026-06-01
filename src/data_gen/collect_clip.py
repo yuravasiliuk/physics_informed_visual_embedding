@@ -1,6 +1,6 @@
 """Reusable Isaac Sim clip-collection module.
 
-Refactor of `collect_smoke.py` (steps 1-2 of `plans/probe-dataset.md` §11).
+Refactor of `collect_smoke.py` (steps 1-2 of `plans/data-gen/probe-dataset.md` §11).
 Every piece is a pure function with explicit parameters so a shard-level
 driver can reuse it without copy-paste.
 

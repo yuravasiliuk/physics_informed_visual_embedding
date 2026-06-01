@@ -32,7 +32,7 @@ def make_annotators(camera_position, look_at, resolution, rp_name=None):
 
     Segmentation uses `semantic_segmentation` (not `instance_segmentation_fast`)
     so prims sharing a `class` label collapse to one ID — step 5.8 of
-    `plans/scene-diversification.md`. Each primitive/asset body carries its
+    `plans/data-gen/scene-diversification.md`. Each primitive/asset body carries its
     own class (its body name) and all scenery shares `class=scenery`, so the
     annotator yields exactly the per-body-plus-scenery grouping the probe
     needs. `colorize=False` keeps the output as raw class IDs.

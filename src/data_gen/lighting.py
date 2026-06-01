@@ -1,5 +1,5 @@
 """Sky lighting for the procedural-ground scenes (step 5.4 of
-plans/scene-diversification.md).
+plans/data-gen/scene-diversification.md).
 
 `setup_random_sky` picks one of three paths:
 

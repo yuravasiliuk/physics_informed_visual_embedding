@@ -39,7 +39,7 @@ They share *thematic* DNA — "use multiple modalities jointly through one model
 - No theory; pure systems / empirical paper.
 
 ## Where to file it
-Tier: **tangential** — alongside [omnicontrol.md](omnicontrol.md) and [rt-h.md](rt-h.md), but with one extra reason to remember it: it pins down what "use a pretrained video model directly as a policy" achieves *without* the brainstorm's physics-supervision route. That is the right-hand-side of the comparison "is explicit physics supervision worth it, or does video-pretraining + joint training suffice?" — a question the planned theoretical paper ([plan §6](../plans/theoretical-paper-plan.md)) should engage with.
+Tier: **tangential** — alongside [omnicontrol.md](omnicontrol.md) and [rt-h.md](rt-h.md), but with one extra reason to remember it: it pins down what "use a pretrained video model directly as a policy" achieves *without* the brainstorm's physics-supervision route. That is the right-hand-side of the comparison "is explicit physics supervision worth it, or does video-pretraining + joint training suffice?" — a question the planned theoretical paper ([plan §6](../plans/theory/theoretical-paper-plan.md)) should engage with.
 
 ## Released artifacts
 - Project page, code, model checkpoints: https://research.nvidia.com/labs/dir/cosmos-policy/

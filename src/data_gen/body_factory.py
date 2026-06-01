@@ -1,7 +1,7 @@
 """Body-factory helpers shared by collect_clip.py and scenarios.py.
 
 Extracted from collect_clip.py during step 5.2 of
-`plans/scene-diversification.md` so scenario builders can call these helpers
+`plans/data-gen/scene-diversification.md` so scenario builders can call these helpers
 without creating a circular import (collect_clip.py imports scenarios.py for
 dispatch in step 5.3).
 

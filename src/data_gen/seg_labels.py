@@ -1,6 +1,6 @@
 """Class-label semantics for the segmentation annotator.
 
-Step 5.8 of `plans/scene-diversification.md` configures Replicator's
+Step 5.8 of `plans/data-gen/scene-diversification.md` configures Replicator's
 `instance_segmentation_fast` annotator to group prims by `class` label
 rather than per-prim instance. This module is the single place where the
 labels get authored, so the convention is uniform across:

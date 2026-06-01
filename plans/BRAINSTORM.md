@@ -29,23 +29,23 @@ at the [root README](../README.md) — this doc does not duplicate it.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — operational status tracker: what's done,
   what's next, and the two hard gates. The *why* for each item lives here; that doc
   tracks the *state*.
-- [observability-weighted-loss.md](observability-weighted-loss.md) — spun off from
+- [observability-weighted-loss.md](theory/observability-weighted-loss.md) — spun off from
   **R6 / §4**: weight physics loss by angular displacement + contact (not linear
   velocity); learned heteroscedastic σ.
-- [physics-latent-ladder.md](physics-latent-ladder.md) — sibling "pragmatic
+- [physics-latent-ladder.md](theory/physics-latent-ladder.md) — sibling "pragmatic
   ladder" brainstorm; pre-experiment staging of physics-latent-dynamics targets.
 
 **Critiques that feed the risks here:**
-- [data_gen_critique0.md](data_gen_critique0.md) → its
-  [analysis](data_gen_critique0_analysis.md) — the data-gen review driving the
+- [data_gen_critique0.md](critique/data_gen_critique0.md) → its
+  [analysis](critique/data_gen_critique0_analysis.md) — the data-gen review driving the
   recent `collect_clip.py` work; source of **R11** (verification gaps).
-- [critque.md](critque.md) → [critique2.md](critique2.md) — earlier
+- [critque.md](critique/critque.md) → [critique2.md](critique/critique2.md) — earlier
   proposal critiques (the single-frame-input fatal-flaw thread).
 
 **Relationship to the committed plan (⚠ open tension):** the
 [root README §Best tactics](../README.md#best-tactics--decisions-were-committing-to)
-and its Era-1 lineage ([theoretical-paper-plan.md](theoretical-paper-plan.md),
-[training-data.md](training-data.md), [probe-dataset.md](probe-dataset.md))
+and its Era-1 lineage ([theoretical-paper-plan.md](theory/theoretical-paper-plan.md),
+[training-data.md](theory/training-data.md), [probe-dataset.md](data-gen/probe-dataset.md))
 **commit** to the two-stream design (frozen + learned conv branch, cross-attention,
 B/F configs) as decided. §2 of this doc **supersedes that for the main line**: the
 default is now a frozen encoder + multi-layer nonlinear head (no raw-pixel
@@ -106,7 +106,7 @@ richness, these become targets with exact labels and no recoverable signal — t
 worst kind of confound. Target learnability must be designed into the *scenarios*,
 not just the labels. Partial mitigation (training-noise half only) via
 observability-weighted loss — see
-[observability-weighted-loss.md](observability-weighted-loss.md): weight by
+[observability-weighted-loss.md](theory/observability-weighted-loss.md): weight by
 angular displacement + contact (not linear velocity), preferably as a learned
 heteroscedastic σ.
 

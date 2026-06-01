@@ -1,6 +1,6 @@
 """Isaac Sim asset library — curated USD paths organized by category.
 
-Step 5.5 of `plans/scene-diversification.md`. Provides three categorized
+Step 5.5 of `plans/data-gen/scene-diversification.md`. Provides three categorized
 lists of USD asset URLs discovered via `get_assets_root_path()`. On import,
 every candidate path is checked against the live Isaac asset server;
 missing paths are logged and dropped from the active set rather than
@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # `_resolve` validates each one and prunes the list to whatever actually
 # exists on the configured asset server.
 #
-# Tier 1 of `plans/isaac-asset-diversification.md`: expanded from the
+# Tier 1 of `plans/data-gen/isaac-asset-diversification.md`: expanded from the
 # original 5 paths (3 of which resolved) to 16 paths across pallets, KLT
 # bins, cabinets, tables/mounts, and industrial scenery, with per-path
 # sampling weights so pallets stop visually dominating every clip. Each

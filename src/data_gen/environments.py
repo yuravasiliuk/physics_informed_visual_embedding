@@ -1,6 +1,6 @@
 """Isaac Sim environment backdrops — warehouse / room / grid-room USDs.
 
-Tier 2 of `plans/isaac-asset-diversification.md`. Each clip samples one
+Tier 2 of `plans/data-gen/isaac-asset-diversification.md`. Each clip samples one
 backdrop uniformly from the discovered envs. Every env USD brings its own
 authored floor and lights, so the caller skips the procedural `GroundPlane`
 and HDRI/fallback distant light to avoid Z-fighting on the floor and

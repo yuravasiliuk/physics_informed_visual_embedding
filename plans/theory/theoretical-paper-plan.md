@@ -6,19 +6,19 @@
 *Multi-Head Physics Supervision for Visual Encoders: Identifiability, Symmetry, and Sim-Asymmetric Generalization.*
 
 ## What's already in the literature (anchors)
-- [SCOPE](../summaries/scope.md) — frozen-DINO + RGB+normals **input** branches, cross-attn fusion. Architectural baseline, but normals are *inputs*, not heads.
-- [Why and How Auxiliary Tasks Improve JEPA](../summaries/why-auxiliary-tasks-jepa.md) — single auxiliary head defines an equivalence relation on latents; "No Unhealthy Collapse" theorem.
-- [PI-JEPA](../summaries/pi-jepa.md) — physics-as-residual (PDE) on a known operator; honest negative that raw residual loss is neutral, gains come from operator-splitting and VICReg.
-- [V-JEPA 2](../summaries/v-jepa2.md) and the [intuitive-physics opinion paper](../summaries/opinion-intuitive-physics.md) — video at scale still fails [IntPhys 2](../summaries/intphys2.md) (96 % human vs 56 % best model).
-- [Cosmos-Transfer2.5](../summaries/cosmos-predict2.5.md) — Sim2Real-by-pixel-translation, the *competing paradigm* to latent alignment.
+- [SCOPE](../../summaries/scope.md) — frozen-DINO + RGB+normals **input** branches, cross-attn fusion. Architectural baseline, but normals are *inputs*, not heads.
+- [Why and How Auxiliary Tasks Improve JEPA](../../summaries/why-auxiliary-tasks-jepa.md) — single auxiliary head defines an equivalence relation on latents; "No Unhealthy Collapse" theorem.
+- [PI-JEPA](../../summaries/pi-jepa.md) — physics-as-residual (PDE) on a known operator; honest negative that raw residual loss is neutral, gains come from operator-splitting and VICReg.
+- [V-JEPA 2](../../summaries/v-jepa2.md) and the [intuitive-physics opinion paper](../../summaries/opinion-intuitive-physics.md) — video at scale still fails [IntPhys 2](../../summaries/intphys2.md) (96 % human vs 56 % best model).
+- [Cosmos-Transfer2.5](../../summaries/cosmos-predict2.5.md) — Sim2Real-by-pixel-translation, the *competing paradigm* to latent alignment.
 
 ## Why we expect to escape PI-JEPA's null result
 
-PI-JEPA is the closest negative empirical precedent: their ablation (Table 5 in the paper, summary in [pi-jepa.md](../summaries/pi-jepa.md)) reports the PDE-residual loss as **neutral** on top of operator splitting and VICReg. Any plan that pattern-matches to "physics loss bolted onto JEPA" inherits this null until argued otherwise. The argument follows.
+PI-JEPA is the closest negative empirical precedent: their ablation (Table 5 in the paper, summary in [pi-jepa.md](../../summaries/pi-jepa.md)) reports the PDE-residual loss as **neutral** on top of operator splitting and VICReg. Any plan that pattern-matches to "physics loss bolted onto JEPA" inherits this null until argued otherwise. The argument follows.
 
 **Different signal class.** PI-JEPA's physics loss is a *residual* on a known operator: the encoder must produce a latent that, when decoded back to physical fields, satisfies a PDE up to autodiff'd residual. This is supervision on a *constraint*, not on an *observable*. Residual losses are easy to satisfy trivially when the residual operator has a large null space (any encoder mapping into the residual's kernel pays no cost). The brainstorm's heads are *direct regression onto observable physical quantities* (CoM in camera frame, ω in camera frame, contact force magnitudes per body). There is no null space — the target is a real number, the prediction is a real number, the loss is L2. The PI-JEPA failure mode does not transfer mechanically.
 
-**Closer empirical analogue: RoboScape.** RoboScape's keypoint-dynamics auxiliary head — a *direct regression* on per-keypoint motion derived from a pretrained perception model — is the right reference point, and it is **positive**: dropping it costs ~21 % on action-conditioning MSE ([roboscape.md](../summaries/roboscape.md) Table 2). Our heads sit in the same family (direct-regression on per-object physical state), so we should expect RoboScape's positive result to be the prior over PI-JEPA's null.
+**Closer empirical analogue: RoboScape.** RoboScape's keypoint-dynamics auxiliary head — a *direct regression* on per-keypoint motion derived from a pretrained perception model — is the right reference point, and it is **positive**: dropping it costs ~21 % on action-conditioning MSE ([roboscape.md](../../summaries/roboscape.md) Table 2). Our heads sit in the same family (direct-regression on per-object physical state), so we should expect RoboScape's positive result to be the prior over PI-JEPA's null.
 
 **What this commits us to predicting.** If RoboScape is the right analogue, the F − B gap should come **from dynamics heads (CoM, ω, v, contact), not from depth / normals / seg** — RoboScape's own ablation found depth nearly flat next to dynamics. Translating to our F-vs-B design ([training-data.md](training-data.md#experimental-configurations-baseline-vs-full)):
 - Geometric heads stabilize the encoder but should not drive F > B by themselves.
@@ -31,7 +31,7 @@ PI-JEPA is the closest negative empirical precedent: their ablation (Table 5 in 
 The initial brainstorm idea is: add sim-only heads (CoM, ω, v, contact) on top of sim+real heads (normals, segmentation, depth). What the existing theory does *not* cover, and what we can add:
 
 ### 1. Multi-head equivalence composition
-Current theory ([Why-Aux-JEPA](../summaries/why-auxiliary-tasks-jepa.md)) handles **one** auxiliary head: each head induces a partition of the input space (equivalence classes of "same-label" inputs). With *K* simultaneous heads the encoder is constrained to the **meet** of those partitions. Open:
+Current theory ([Why-Aux-JEPA](../../summaries/why-auxiliary-tasks-jepa.md)) handles **one** auxiliary head: each head induces a partition of the input space (equivalence classes of "same-label" inputs). With *K* simultaneous heads the encoder is constrained to the **meet** of those partitions. Open:
 - When is the meet *strictly finer* (i.e. heads complementary), and when is it redundant?
 - Information-theoretic lower bound on the latent dimension as a function of the heads.
 - Generalization of "No Unhealthy Collapse" to multi-head with possibly conflicting equivalence relations.
@@ -76,7 +76,7 @@ CoM, momentum, energy are conserved across time. Predicting them at each frame i
 - Prove that the conservation-law constraint reduces the function space more than a pointwise loss with equivalent supervision budget.
 
 ### 6. Bias–variance trade-off: latent alignment vs pixel translation for Sim2Real
-[Cosmos-Transfer2.5](../summaries/cosmos-predict2.5.md) is a direct competitor. We can frame both as estimators of P(Y_real | X_real):
+[Cosmos-Transfer2.5](../../summaries/cosmos-predict2.5.md) is a direct competitor. We can frame both as estimators of P(Y_real | X_real):
 - **Translation:** `X_sim → X_real_like → encoder → Y`. Variance from the translator, bias from translator's distributional gap.
 - **Latent alignment:** `X_sim → encoder → Y` with auxiliary heads tying φ(X_sim) to φ(X_real). Variance from sim/real label asymmetry, bias from the encoder's domain-confusion.
 
@@ -96,7 +96,7 @@ Quantify the regimes (small/large sim corpus, fidelity of translation, head budg
 6. **First-order supervision** (gap §4). Fisher-info gain; degeneracy detector; relation to differentiable rendering.
 7. **Conservation laws** (gap §5). Encoder-on-manifold formulation; Noether interpretation.
 8. **Sim2Real estimator comparison** (gap §6). Bias-variance theorem; regime diagram (small/large data, weak/strong translator).
-9. **Discussion.** Limits of theory, what remains empirical, connection to world-model RL ([DreamerV3](../summaries/dreamer-v3.md), [V-JEPA-2-AC](../summaries/v-jepa2.md)).
+9. **Discussion.** Limits of theory, what remains empirical, connection to world-model RL ([DreamerV3](../../summaries/dreamer-v3.md), [V-JEPA-2-AC](../../summaries/v-jepa2.md)).
 
 ## Theoretical deliverables (concrete prop/theorem checklist)
 - **Prop 1.** Multi-head meet identifiability — when φ is identifiable up to a residual symmetry given K heads.
@@ -115,7 +115,7 @@ Quantify the regimes (small/large sim corpus, fidelity of translation, head budg
 4. Are there published equivariant-multi-task theorems we should cite or extend (likely yes — equivariant SSL recent literature, not in the current reading pile)?
 
 ## Reading still owed
-Before writing, fill these holes (none currently covered in [summaries/](../summaries/)):
+Before writing, fill these holes (none currently covered in [summaries/](../../summaries/)):
 - Multi-task identifiability / nonlinear ICA (Khemakhem 2020, Hyvärinen 2023+).
 - Equivariant SSL (Garrido et al. 2023+, Elesedy 2021).
 - Differentiable rendering for supervision (Mitsuba 3, Genesis, Nvdiffrast).

@@ -65,6 +65,6 @@ Concrete port: in the fusion/predictor stage, **inject camera intrinsics, light 
 ## Pointers worth chasing
 - TI-JEPA [80], A-JEPA [30], PrediCIR [71] — other cross-modal JEPA flavors cited in §2.
 - Pic@Point [40] — closest concatenation-style image-point baseline; CrossJEPA beats it.
-- Suppl. §D — predictive-coding / information-theoretic justification for the nuisance sink. Could feed [theoretical-paper-plan.md](../plans/theoretical-paper-plan.md) if it formalizes the "noise decoupling" claim.
+- Suppl. §D — predictive-coding / information-theoretic justification for the nuisance sink. Could feed [theoretical-paper-plan.md](../plans/theory/theoretical-paper-plan.md) if it formalizes the "noise decoupling" claim.
 
 Code: stated as forthcoming, not yet released as of v1.

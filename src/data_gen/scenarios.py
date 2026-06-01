@@ -1,6 +1,6 @@
 """Scenario builders for RigidProbe v0.1.
 
-Step 5.2 of `plans/scene-diversification.md`. Each archetype is a function:
+Step 5.2 of `plans/data-gen/scene-diversification.md`. Each archetype is a function:
 
     build_<name>(world, rng, config) -> (bodies, body_specs, scene_specs, initial_velocities)
 

@@ -1,14 +1,14 @@
 # Synthetic data collection — Isaac Sim pipeline
 
-**Date:** 2026-05-21. Status: pre-implementation engineering plan. Companion to [training-data.md](training-data.md) and [domain-marginalization-regularizer.md](domain-marginalization-regularizer.md).
+**Date:** 2026-05-21. Status: pre-implementation engineering plan. Companion to [training-data.md](../theory/training-data.md) and [domain-marginalization-regularizer.md](../theory/domain-marginalization-regularizer.md).
 
-This document specifies *how* to actually produce the sim half of the corpus described in [training-data.md](training-data.md). The high-level choices (Isaac Lab, ≥30 % free objects, 16-frame clips @ 30 Hz, all seven heads logged per frame) are inherited from that file.
+This document specifies *how* to actually produce the sim half of the corpus described in [training-data.md](../theory/training-data.md). The high-level choices (Isaac Lab, ≥30 % free objects, 16-frame clips @ 30 Hz, all seven heads logged per frame) are inherited from that file.
 
 ## Decisions fixed in this round
 
 - **Scope.** Both free-object and manipulation. Free-object scenes first (no controller, fastest debug loop); manipulation layered in once the pipeline is stable.
-- **Compute.** Single workstation, 1–2 GPUs. Realistic ceiling is **~10k–50k clips total**, not the 100k–500k target in [training-data.md](training-data.md#targets-placeholder--revise-after-pilot). Treat that target as the cluster-scale figure; this collection is the workstation pilot.
-- **Realism.** Decent assets + heavy domain randomization, not strict photorealism. Render in Isaac's **RTX Real-Time** mode (or PT at low samples, 4–16) — quality budget goes to scene/material/lighting diversity, not per-frame fidelity. Appearance bridging via Cosmos-Transfer2.5 is deferred to a later pass (option B/C in [training-data.md §Open design decisions](training-data.md#open-design-decisions-resolve-before-pipeline-build-out) point 2).
+- **Compute.** Single workstation, 1–2 GPUs. Realistic ceiling is **~10k–50k clips total**, not the 100k–500k target in [training-data.md](../theory/training-data.md#targets-placeholder--revise-after-pilot). Treat that target as the cluster-scale figure; this collection is the workstation pilot.
+- **Realism.** Decent assets + heavy domain randomization, not strict photorealism. Render in Isaac's **RTX Real-Time** mode (or PT at low samples, 4–16) — quality budget goes to scene/material/lighting diversity, not per-frame fidelity. Appearance bridging via Cosmos-Transfer2.5 is deferred to a later pass (option B/C in [training-data.md §Open design decisions](../theory/training-data.md#open-design-decisions-resolve-before-pipeline-build-out) point 2).
 
 ## Asset sources (decent-tier, free or research-licensed)
 
@@ -68,9 +68,9 @@ For each frame in each clip, log:
 | Contact reports | `ContactSensor` per dynamic body | Parquet, sparse rows per contact event |
 | Camera intrinsics + extrinsics | Replicator camera state | JSON per clip |
 
-Per-body state columns: `body_id, frame, mass, CoM_world (xyz), v_world (xyz), ω_world (xyz), pose_world (7-vec), kinematic_flag, bbox_diag, compact_flag` (the compact_flag implements the CoM filter from [training-data.md "Label semantics"](training-data.md#label-semantics)). Distance-to-ground is intentionally omitted from the supervision head set in this phase; if added later it can be derived offline from `pose_world` + the ground-plane geometry.
+Per-body state columns: `body_id, frame, mass, CoM_world (xyz), v_world (xyz), ω_world (xyz), pose_world (7-vec), kinematic_flag, bbox_diag, compact_flag` (the compact_flag implements the CoM filter from [training-data.md "Label semantics"](../theory/training-data.md#label-semantics)). Distance-to-ground is intentionally omitted from the supervision head set in this phase; if added later it can be derived offline from `pose_world` + the ground-plane geometry.
 
-Camera-frame conversion (CoM, v, ω → camera frame to match [training-data.md "Label semantics"](training-data.md#label-semantics)) happens *offline* at dataloader time so the raw log keeps world-frame state — cheaper to recompute than to re-render if the convention changes.
+Camera-frame conversion (CoM, v, ω → camera frame to match [training-data.md "Label semantics"](../theory/training-data.md#label-semantics)) happens *offline* at dataloader time so the raw log keeps world-frame state — cheaper to recompute than to re-render if the convention changes.
 
 ## Domain randomization knobs (heavy)
 
@@ -85,7 +85,7 @@ Randomized **per clip**, not per frame (frame-coherent within a clip):
 - Background: HDRI-only vs HDRI + simple room geometry, 50/50.
 - Post: gaussian noise σ ∈ [0, 0.01], optional motion blur, JPEG re-encoding at quality ∈ [70, 95] for ~10 % of clips (matches real-data compression artifacts).
 
-The point is **breadth, not fidelity** — see [domain-marginalization-regularizer.md "Why this exists"](domain-marginalization-regularizer.md). The regularizer assumes the encoder can't trivially classify sim vs real from pixel statistics; aggressive DR is what makes that assumption defensible without the heavy Cosmos-Transfer step.
+The point is **breadth, not fidelity** — see [domain-marginalization-regularizer.md "Why this exists"](../theory/domain-marginalization-regularizer.md). The regularizer assumes the encoder can't trivially classify sim vs real from pixel statistics; aggressive DR is what makes that assumption defensible without the heavy Cosmos-Transfer step.
 
 ## Output format and storage
 
@@ -117,17 +117,17 @@ Plan for 10k free-object + 5k manipulation as the **workstation-feasible Phase-1
 6. **Phase 1c — 10k clips free-object.** Full Phase-1 corpus. Train B and F to convergence; first real B-vs-F comparison.
 7. **Phase 2a — Franka pick-place smoke test.** 100 clips. Verify controller, contact reports under grasp, articulation state logging.
 8. **Phase 2b — 5k manipulation clips.** Three manipulation templates. Integrate into Phase-1 corpus.
-9. **Decision gate.** If F shows signal over B, push to cluster for 100k+ extension (see [training-data.md §Targets](training-data.md#targets-placeholder--revise-after-pilot)). If not, diagnose using [domain-marginalization-regularizer.md "Diagnostics"](domain-marginalization-regularizer.md#diagnostics--is-the-regularizer-actually-working).
+9. **Decision gate.** If F shows signal over B, push to cluster for 100k+ extension (see [training-data.md §Targets](../theory/training-data.md#targets-placeholder--revise-after-pilot)). If not, diagnose using [domain-marginalization-regularizer.md "Diagnostics"](../theory/domain-marginalization-regularizer.md#diagnostics--is-the-regularizer-actually-working).
 
 ## Open questions
 
 - **Cosmos-Transfer pass — when?** Skipped in Phase 1. After Phase 1c, run Cosmos-Transfer2.5 on a 1k-clip subsample to estimate cost; decide whether to translate the full corpus or only the manipulation slice (where appearance gap to AgiBot/DROID matters most).
-- **Differentiable rendering deferred.** Required for [theoretical-paper-plan.md §4](theoretical-paper-plan.md). Genesis or Mitsuba 3 path is a separate effort not in this pilot.
+- **Differentiable rendering deferred.** Required for [theoretical-paper-plan.md §4](../theory/theoretical-paper-plan.md). Genesis or Mitsuba 3 path is a separate effort not in this pilot.
 - **Asset license audit.** Objaverse-XL is mixed-license — needs a license filter on the filtered subset before any release/publication.
 - **Mass / friction priors from GSO/ABO?** Both ship measured masses for some objects, defaults for others. Decide whether to honor measured values (smaller DR range, more realistic) or override with the DR distribution (broader coverage). Defaults: honor measured when present.
 
 ## Connections to the rest of the plan
 
-- This pipeline produces the sim half referenced in [training-data.md §Synthetic data generation](training-data.md#synthetic-data-generation). Real-side ingestion (AgiBot-World-Beta + ScanNet++) is out of scope here.
-- The "decent + heavy DR" choice (rather than strict photorealism or Cosmos-Transfer up front) is **only defensible if** the regularizer in [domain-marginalization-regularizer.md](domain-marginalization-regularizer.md) actually bites. The diagnostic on domain-classifier accuracy is the first thing to check after Phase 1c.
-- Phase-1c output is the input to the first real B-vs-F experiment (see [training-data.md §Experimental configurations](training-data.md#experimental-configurations-baseline-vs-full)).
+- This pipeline produces the sim half referenced in [training-data.md §Synthetic data generation](../theory/training-data.md#synthetic-data-generation). Real-side ingestion (AgiBot-World-Beta + ScanNet++) is out of scope here.
+- The "decent + heavy DR" choice (rather than strict photorealism or Cosmos-Transfer up front) is **only defensible if** the regularizer in [domain-marginalization-regularizer.md](../theory/domain-marginalization-regularizer.md) actually bites. The diagnostic on domain-classifier accuracy is the first thing to check after Phase 1c.
+- Phase-1c output is the input to the first real B-vs-F experiment (see [training-data.md §Experimental configurations](../theory/training-data.md#experimental-configurations-baseline-vs-full)).

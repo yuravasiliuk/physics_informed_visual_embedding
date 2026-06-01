@@ -1,6 +1,6 @@
 """Isaac Sim asset loaders.
 
-Step 5.6 of `plans/scene-diversification.md`. Two helpers — one for static
+Step 5.6 of `plans/data-gen/scene-diversification.md`. Two helpers — one for static
 colliders (no dynamics, scene scaffolding) and one for dynamic rigid bodies
 (drop-in replacement for primitive bodies in body_factory).
 

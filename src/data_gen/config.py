@@ -4,7 +4,7 @@ Two kinds of config live here:
 
   * `ClipConfig` — the per-clip / per-run parameter bundle (frozen dataclass),
     overridable via `dataclasses.replace`. Defaults follow §7 of
-    `plans/probe-dataset.md`.
+    `plans/data-gen/probe-dataset.md`.
   * Module-level constants — scenario-builder tunables (geometry, spawn boxes,
     speed/angle ranges) and a couple of filesystem paths.
 
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ClipConfig:
-    """Per-clip generation parameters. Defaults follow §7 of plans/probe-dataset.md."""
+    """Per-clip generation parameters. Defaults follow §7 of plans/data-gen/probe-dataset.md."""
 
     # Capture
     frame_count: int = 32                     # K — plan §7

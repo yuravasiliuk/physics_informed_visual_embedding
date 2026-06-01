@@ -1,7 +1,7 @@
 # Observability-Weighted Loss for Physics Targets
 
 *Date: 2026-05-30. Design note addressing Risk 6 of
-[BRAINSTORM.md](BRAINSTORM.md)
+[BRAINSTORM.md](../BRAINSTORM.md)
 ("unlearnable-but-perfectly-labeled targets"). Companion to the CoM /
 heteroscedastic-uncertainty discussion there (§4).*
 

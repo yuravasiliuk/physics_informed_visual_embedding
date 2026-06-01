@@ -1,7 +1,7 @@
 # How to conduct data-gen tests
 
 Operational guide for validating the Isaac Sim data-collection pipeline
-([src/data_gen/](../src/data_gen/)). The *why* behind the labels and scenes
+([src/data_gen/](../../src/data_gen/)). The *why* behind the labels and scenes
 lives in [probe-dataset.md](probe-dataset.md), [scene-diversification.md](scene-diversification.md),
 [physics-diversification.md](physics-diversification.md), and
 [camera-framing-fix.md](camera-framing-fix.md); this doc is the **how-to-check-it**.
@@ -20,7 +20,7 @@ layer makes the ones above meaningless.
 
 ## 0. Static checks (no Isaac)
 
-Run from [src/data_gen/](../src/data_gen/). These catch the bulk of edit
+Run from [src/data_gen/](../../src/data_gen/). These catch the bulk of edit
 mistakes before paying the ~30–60 s Isaac boot.
 
 ```bash
@@ -83,7 +83,7 @@ and scales with impulse.
 ## 2. Smoke generation (Isaac)
 
 Generate a small batch through the production entry point
-[collect_clip.py](../src/data_gen/collect_clip.py) and confirm the clips are
+[collect_clip.py](../../src/data_gen/collect_clip.py) and confirm the clips are
 well-formed.
 
 ```bash
@@ -177,7 +177,7 @@ effectively black.)
 | Symptom | Likely cause | Where to look |
 |---|---|---|
 | `RuntimeError: could not place N bodies without overlap` | a spawn footprint too small for the body size (e.g. env scale-up without scaling the scenery) | `scenarios._scene_scale` / `_scaled`; rerun the Layer-0 placement check |
-| Clips render with **no environment backdrop** (procedural ground only) | `config.use_isaac_envs = False`, or the env failed `omni.client.stat` and was dropped at discovery | [config.py](../src/data_gen/config.py) `use_isaac_envs`; `environments.discover` warnings |
+| Clips render with **no environment backdrop** (procedural ground only) | `config.use_isaac_envs = False`, or the env failed `omni.client.stat` and was dropped at discovery | [config.py](../../src/data_gen/config.py) `use_isaac_envs`; `environments.discover` warnings |
 | A specific env renders **textureless / white floor** | bad MDL/material binding on the local asset mirror (this is why `office.usd` is excluded) | `environments.CANDIDATE_ENVIRONMENTS` |
 | Rollout emits **0 clips** | visibility gate dropped every camera (genuinely un-viewable scene) | expected occasionally; investigate only if frequent |
 | Action **occluded / tiny / off-frame** | camera framing or gating regression | run Layer 3; check `frame_fill_frac`, `min_body_coverage`, the pre-roll |

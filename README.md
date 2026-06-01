@@ -30,7 +30,7 @@ below is unchanged.
 Two refinements to the sketch the plans commit to (orthogonal to the backbone choice):
 - The encoder is **clip-level**, K = 4–16 frames. ω, v, and time-derivatives of CoM
   are not observable from a single frame, so single-frame inputs are off the table.
-  See [training-data.md §Architecture — temporal modeling](plans/training-data.md#architecture--temporal-modeling).
+  See [training-data.md §Architecture — temporal modeling](plans/theory/training-data.md#architecture--temporal-modeling).
 - Dynamics heads (CoM, ω, v, contact) are **per-object**, not per-pixel — masked-pool
   the encoder features over each body's predicted segmentation, then one MLP per head.
   Per-pixel dynamics is degenerate (constant within each segment) and trivially
@@ -48,8 +48,8 @@ For depth on any topic, follow the links into [plans/](plans/) and [summaries/](
 | [Physics informed embedding.pdf](Physics%20informed%20embedding.pdf) | The original architecture sketch. |
 | [papers/](papers/) | PDFs of the literature we read while scoping the project. |
 | [summaries/](summaries/) | Per-paper working notes + the cross-paper index in [summaries/README.md](summaries/README.md). |
-| [plans/](plans/) | Design docs, two lineages. **Committed plan (read in order):** [theoretical-paper-plan.md](plans/theoretical-paper-plan.md) → [training-data.md](plans/training-data.md) → [domain-marginalization-regularizer.md](plans/domain-marginalization-regularizer.md) → [synthetic-data-collection.md](plans/synthetic-data-collection.md); dataset spec stack [probe-dataset.md](plans/probe-dataset.md) → [scene-diversification.md](plans/scene-diversification.md) → [isaac-asset-diversification.md](plans/isaac-asset-diversification.md). **Active brainstorm hub:** [BRAINSTORM.md](plans/BRAINSTORM.md) (its §0 maps the rest of that cluster). **Build status / what's-done-vs-next:** [IMPLEMENTATION.md](plans/IMPLEMENTATION.md). **Critiques:** [critque.md](plans/critque.md) → [critique2.md](plans/critique2.md), [data_gen_critique0.md](plans/data_gen_critique0.md). |
-| [src/data_gen/](src/data_gen/) | Isaac Sim data-collection code (the only code so far). Entry point: [collect_clip.py](src/data_gen/collect_clip.py) (refactor of the original smoke script into reusable pieces; see [plans/probe-dataset.md](plans/probe-dataset.md)). How to validate a run: [plans/data-gen-testing.md](plans/data-gen-testing.md). Encoder / training / experiment code is **planned, not yet written** — see §Baseline to implement. |
+| [plans/](plans/) | Design docs, grouped into [theory/](plans/theory/) (modeling/paper), [data-gen/](plans/data-gen/) (collection pipeline), [critique/](plans/critique/) (reviews); [BRAINSTORM.md](plans/BRAINSTORM.md) + [IMPLEMENTATION.md](plans/IMPLEMENTATION.md) stay at the root as hubs. Two lineages. **Committed plan (read in order):** [theoretical-paper-plan.md](plans/theory/theoretical-paper-plan.md) → [training-data.md](plans/theory/training-data.md) → [domain-marginalization-regularizer.md](plans/theory/domain-marginalization-regularizer.md) → [synthetic-data-collection.md](plans/data-gen/synthetic-data-collection.md); dataset spec stack [probe-dataset.md](plans/data-gen/probe-dataset.md) → [scene-diversification.md](plans/data-gen/scene-diversification.md) → [isaac-asset-diversification.md](plans/data-gen/isaac-asset-diversification.md). **Active brainstorm hub:** [BRAINSTORM.md](plans/BRAINSTORM.md) (its §0 maps the rest of that cluster). **Build status / what's-done-vs-next:** [IMPLEMENTATION.md](plans/IMPLEMENTATION.md). **Critiques:** [critque.md](plans/critique/critque.md) → [critique2.md](plans/critique/critique2.md), [data_gen_critique0.md](plans/critique/data_gen_critique0.md). |
+| [src/data_gen/](src/data_gen/) | Isaac Sim data-collection code (the only code so far). Entry point: [collect_clip.py](src/data_gen/collect_clip.py) (refactor of the original smoke script into reusable pieces; see [plans/probe-dataset.md](plans/data-gen/probe-dataset.md)). How to validate a run: [plans/data-gen-testing.md](plans/data-gen/data-gen-testing.md). Encoder / training / experiment code is **planned, not yet written** — see §Baseline to implement. |
 | [notebooks/](notebooks/) | Scratch / exploratory notebooks. |
 
 ---
@@ -90,7 +90,7 @@ take-aways for our design are:
   as **neutral** on top of operator splitting + VICReg. We argue we escape this because
   our heads regress *observables* (CoM, ω, v) rather than enforcing a residual *constraint*
   on an operator with a large null space — see [theoretical-paper-plan.md "Why we expect
-  to escape PI-JEPA's null result"](plans/theoretical-paper-plan.md#why-we-expect-to-escape-pi-jepas-null-result).
+  to escape PI-JEPA's null result"](plans/theory/theoretical-paper-plan.md#why-we-expect-to-escape-pi-jepas-null-result).
   If F ≈ B in practice, that argument is wrong and the project pivots.
 - **Encoder candidates for the frozen branch:** [V-JEPA 2](summaries/v-jepa2.md) is the
   current default (zero-shot robot planning from RGB, scales to internet video). DINOv2
@@ -111,7 +111,7 @@ Pulled from the design docs; cite the source whenever you change one of these.
 > **B/F configs below are about head sets** (B = dense only; F = + physics), which is
 > orthogonal to the backbone choice and unchanged.
 
-### Theoretical scope ([plans/theoretical-paper-plan.md](plans/theoretical-paper-plan.md))
+### Theoretical scope ([plans/theoretical-paper-plan.md](plans/theory/theoretical-paper-plan.md))
 - The first paper is **theory-only**. No experiments needed to ship it.
 - The distinctive contributions, in priority order: (1) domain-marginalization regularizer
   with a transfer bound for sim-only heads, (2) first-order / counterfactual supervision
@@ -120,7 +120,7 @@ Pulled from the design docs; cite the source whenever you change one of these.
 - Equivariance structure of physical heads (SE(3)_camera × stab(g)_world) is the
   minimum group to design for.
 
-### Training data ([plans/training-data.md](plans/training-data.md))
+### Training data ([plans/training-data.md](plans/theory/training-data.md))
 - **Real-data starting mix:** AgiBot-World-Beta (manipulation, mirrors RoboScape/Cosmos)
   + ScanNet++ (sensor-grade depth & normals).
 - **Simulator:** Isaac Lab. Matches Cosmos and IntPhys 2 stacks; full label coverage.
@@ -128,7 +128,7 @@ Pulled from the design docs; cite the source whenever you change one of these.
   DINOv2 only as a single-frame geometry-only ablation.
 - **Frozen-first head** (main line): multi-layer nonlinear head over V-JEPA 2's
   intermediate features; no raw-pixel conv backbone unless the layer-wise probe
-  earns it. See [training-data.md §Architecture](plans/training-data.md#architecture--temporal-modeling)
+  earns it. See [training-data.md §Architecture](plans/theory/training-data.md#architecture--temporal-modeling)
   and [BRAINSTORM.md §2](plans/BRAINSTORM.md#2-architecture).
 - **All labels in camera frame.** Dense heads (depth, normals, seg) are per-pixel
   with an *ignore mask* for background. Dynamics heads (CoM, ω, v, contact) are
@@ -144,7 +144,7 @@ Pulled from the design docs; cite the source whenever you change one of these.
   - **F (full):** B + CoM, ω, v, contact. Sim-only heads add the asymmetric
     supervision the regularizer is also designed to defend against.
 
-### Domain-marginalization regularizer ([plans/domain-marginalization-regularizer.md](plans/domain-marginalization-regularizer.md))
+### Domain-marginalization regularizer ([plans/domain-marginalization-regularizer.md](plans/theory/domain-marginalization-regularizer.md))
 - **Primary role:** sim→real bridging mechanism. The whole project hinges on
   `φ(X_sim) ≈ φ(X_real)` in distribution so that sim-trained policies deploy on real.
   The regularizer is the forcing function that makes that hold.
@@ -158,7 +158,7 @@ Pulled from the design docs; cite the source whenever you change one of these.
 - The **Jacobian-column-space constraint** (the version the theorem is about) is
   parked for a later pass — implement it after A+C are stable.
 
-### Synthetic data collection ([plans/synthetic-data-collection.md](plans/synthetic-data-collection.md))
+### Synthetic data collection ([plans/synthetic-data-collection.md](plans/data-gen/synthetic-data-collection.md))
 - Workstation-scale pilot, not cluster scale: **10k free-object + 5k manipulation**
   clips for Phase 1.
 - Realism budget goes to **diversity** (lights, materials, cameras), not per-frame
@@ -184,7 +184,7 @@ is layered on top.
 
 Concretely:
 
-1. **Data collection — finish Phase 1 of [synthetic-data-collection.md §Implementation order](plans/synthetic-data-collection.md#implementation-order).**
+1. **Data collection — finish Phase 1 of [synthetic-data-collection.md §Implementation order](plans/data-gen/synthetic-data-collection.md#implementation-order).**
    - **Step 1 (in flight).** Phase-0 collection script: [src/data_gen/collect_clip.py](src/data_gen/collect_clip.py)
      renders one free-object drop with 3 primitives, captures RGB + depth + normals +
      instance-seg per frame, logs per-body state to JSON. Refactored from the
@@ -224,7 +224,7 @@ Concretely:
      [BRAINSTORM.md §2](plans/BRAINSTORM.md#2-architecture).
    - Heads: dense per-pixel depth, normals, instance segmentation. No dynamics heads
      in B (those come with F, and are per-object).
-   - All labels in camera frame, ignore-masked background, per [training-data.md "Label semantics"](plans/training-data.md#label-semantics).
+   - All labels in camera frame, ignore-masked background, per [training-data.md "Label semantics"](plans/theory/training-data.md#label-semantics).
 3. **Training loop.**
    - Mixed sim + real batches **from the start** — the regularizer can only align
      domains it sees together. Acceptable temporary substitute while real ingestion
@@ -259,16 +259,16 @@ A successful baseline is one where:
   every entry; read [scope.md](summaries/scope.md), [roboscape.md](summaries/roboscape.md),
   [why-auxiliary-tasks-jepa.md](summaries/why-auxiliary-tasks-jepa.md), and
   [opinion-intuitive-physics.md](summaries/opinion-intuitive-physics.md) in full.
-  Then [theoretical-paper-plan.md](plans/theoretical-paper-plan.md). After that you
+  Then [theoretical-paper-plan.md](plans/theory/theoretical-paper-plan.md). After that you
   should be able to pick up any open question listed in the plans.
-- **Engineers** — start with [synthetic-data-collection.md](plans/synthetic-data-collection.md)
-  and [probe-dataset.md](plans/probe-dataset.md), then run
+- **Engineers** — start with [synthetic-data-collection.md](plans/data-gen/synthetic-data-collection.md)
+  and [probe-dataset.md](plans/data-gen/probe-dataset.md), then run
   [src/data_gen/collect_clip.py](src/data_gen/collect_clip.py) to verify the
   Isaac Sim pipeline produces the expected outputs. Anything in
-  [probe-dataset.md §11 Implementation order](plans/probe-dataset.md#11-implementation-order)
+  [probe-dataset.md §11 Implementation order](plans/data-gen/probe-dataset.md#11-implementation-order)
   Steps 2+ is fair game.
 - **Free contributors** — the cheapest contributions right now are: (a) reading-pile
-  gaps in [theoretical-paper-plan.md §"Reading still owed"](plans/theoretical-paper-plan.md#reading-still-owed)
+  gaps in [theoretical-paper-plan.md §"Reading still owed"](plans/theory/theoretical-paper-plan.md#reading-still-owed)
   and writing a summary in the style of the others; (b) the sanity-dashboard tool
   (Step 2); (c) WebDataset packaging utilities for Step 3.
 
