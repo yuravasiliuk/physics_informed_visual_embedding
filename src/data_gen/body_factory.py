@@ -23,7 +23,8 @@ from omni.isaac.core.objects import (
     DynamicCylinder,
     DynamicSphere,
 )
-from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics
+from omni.isaac.core.prims import RigidPrim
+from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics, UsdShade
 
 from config import GRID_TEXTURE_CACHE
 from seg_labels import apply_class_label
@@ -413,6 +414,7 @@ def spawn_body(world, rng, config, i, shape, dims, position, color=None, orienta
     spec = {
         "id": i + 1,
         "name": name,
+        "kind": "primitive",
         "shape": shape,
         "asset_url": None,
         "dims": list(map(float, dims)),
@@ -434,6 +436,200 @@ def spawn_body(world, rng, config, i, shape, dims, position, color=None, orienta
     return body, spec
 
 
+def _bind_material(prim, material, purpose=None):
+    """Bind a UsdShade.Material directly to `prim`. Used for composite bodies,
+    where the rigid body is a parent Xform and the visible/collidable geometry
+    are child Cubes: SingleRigidPrim exposes the dynamics interface but not
+    GeometryPrim's `apply_*_material`, so we bind at the USD level. Binding is
+    applied to each child gprim (NOT the parent — parent-Xform bindings don't
+    propagate to the child Cubes for RTX rendering). The same material is bound
+    to every child, so the composite still has one uniform appearance (no
+    per-slab colour cue, R8). `purpose="physics"` binds a PhysicsMaterial.
+    """
+    binding = UsdShade.MaterialBindingAPI.Apply(prim)
+    if purpose is None:
+        binding.Bind(material, UsdShade.Tokens.weakerThanDescendants)
+    else:
+        binding.Bind(material, UsdShade.Tokens.weakerThanDescendants, purpose)
+
+
+def _partition_cuboid(rng, dims, n_parts, min_frac):
+    """Split a cuboid (sx, sy, sz) into `n_parts` contiguous slabs along one
+    random axis. Returns (parts, split_axis) where `parts` is a list of
+    (slab_dims, offset_local): each slab keeps the full cross-section on the two
+    non-split axes and a fraction of the box on the split axis; `offset_local`
+    is the slab centre relative to the box centre.
+
+    The slabs tile the box exactly — no overlap, no gap — so the union IS the
+    cuboid bbox and Σ slab volume == box volume. This is what keeps the analytic
+    composite mass/CoM closed-form (overlap would double-count mass). Slab
+    lengths are a Dirichlet draw clamped to `min_frac` of the axis so no slab is
+    a degenerate sliver.
+    """
+    dims = np.asarray(dims, dtype=np.float64)
+    axis = int(rng.integers(0, 3))
+    fracs = rng.dirichlet(np.ones(n_parts))
+    fracs = np.maximum(fracs, min_frac)
+    fracs = fracs / fracs.sum()                         # renormalise to tile exactly
+    lengths = fracs * dims[axis]
+    edges = np.concatenate([[0.0], np.cumsum(lengths)])
+    centres = 0.5 * (edges[:-1] + edges[1:]) - 0.5 * dims[axis]   # rel. box centre
+    parts = []
+    for k in range(n_parts):
+        slab_dims = dims.copy()
+        slab_dims[axis] = lengths[k]
+        offset = np.zeros(3)
+        offset[axis] = centres[k]
+        parts.append((slab_dims, offset))
+    return parts, axis
+
+
+def spawn_composite_body(world, rng, config, i, dims, position, color=None, orientation=None):
+    """Spawn one composite rigid body; return (body, spec) (W5).
+
+    A composite is a uniform-colour cuboid of overall size `dims`, internally
+    split into 2-3 contiguous density slabs (`_partition_cuboid`). Each slab is a
+    child Cube collider carrying its OWN density (`attach_density`); PhysX
+    integrates the union into the body's mass / CoM / inertia at world.reset().
+    No mass/CoM is authored on the body — unlike the W2 single-primitive path,
+    the offset CoM *emerges* from the real mass distribution. Because the slabs
+    share one material, the density asymmetry is invisible: the CoM is
+    recoverable only from geometry + dynamics, never pixels (R8).
+
+    The spec advertises `shape="cuboid"`, `dims=bbox` so every existing
+    placement / lean / preroll path treats a composite exactly like a cuboid.
+    Labels are closed-form: `mass = Σ ρ_k V_k`, `com_local = Σ ρ_k V_k t_k / mass`
+    (logged as `com_local_analytic`); the post-reset `read_local_com` /
+    `get_mass` cross-check in collect_clip must agree (asserted by the W5 verify
+    case). Inertia stays PhysX-computed and unverified (no clean closed form).
+
+    RNG draw order: color -> n_parts -> split(axis, lengths) -> per-slab density
+    -> friction(s) -> restitution -> roughness/metallic.
+    """
+    stage = omni.usd.get_context().get_stage()
+    name = f"body_{i:02d}"
+    prim_path = f"/World/{name}"
+    if color is None:
+        color = sample_color(
+            rng, config.color_hue_range, config.color_sat_range, config.color_val_range,
+        )
+
+    # Parent Xform = the single rigid body; child Cubes are its colliders.
+    UsdGeom.Xform.Define(stage, prim_path)
+    parent_prim = stage.GetPrimAtPath(prim_path)
+
+    n_parts = int(rng.integers(
+        config.composite_n_parts_range[0], config.composite_n_parts_range[1] + 1,
+    ))
+    parts_geom, split_axis = _partition_cuboid(
+        rng, dims, n_parts, config.composite_split_min_frac,
+    )
+
+    part_specs = []
+    child_prims = []
+    total_mass = 0.0
+    com_num = np.zeros(3, dtype=np.float64)
+    for k, (slab_dims, offset) in enumerate(parts_geom):
+        part_path = f"{prim_path}/part_{k:02d}"
+        cube = UsdGeom.Cube.Define(stage, part_path)
+        cube.GetSizeAttr().Set(1.0)                     # unit cube -> side == scale
+        xc = UsdGeom.XformCommonAPI(cube.GetPrim())
+        xc.SetScale(Gf.Vec3f(float(slab_dims[0]), float(slab_dims[1]), float(slab_dims[2])))
+        xc.SetTranslate(Gf.Vec3d(float(offset[0]), float(offset[1]), float(offset[2])))
+        cube_prim = cube.GetPrim()
+        child_prims.append(cube_prim)
+        UsdPhysics.CollisionAPI.Apply(cube_prim)
+        density = float(rng.uniform(*config.density_range))
+        attach_density(cube_prim, density)
+        volume = float(slab_dims[0] * slab_dims[1] * slab_dims[2])
+        mass_k = density * volume
+        total_mass += mass_k
+        com_num += mass_k * offset
+        part_specs.append({
+            "shape": "cuboid",
+            "dims": [float(x) for x in slab_dims],
+            "offset_local": [float(x) for x in offset],
+            "density": density,
+            "volume": volume,
+            "mass": mass_k,
+        })
+    com_local_analytic = com_num / total_mass
+
+    # Make the parent a rigid body (PhysX computes mass/CoM/inertia from the
+    # child colliders + their densities). Apply the API explicitly before
+    # wrapping — the proven asset_loader.load_dynamic_asset pattern.
+    UsdPhysics.RigidBodyAPI.Apply(parent_prim)
+    zero_damping(parent_prim)
+
+    # One shared visual + physics material, bound to EACH child gprim. Binding on
+    # the parent Xform does NOT propagate to the child Cubes for RTX rendering
+    # (a smoke run showed composites rendering default grey, not their sampled
+    # colour — which would itself be an R8 cue: "grey box == composite"). Binding
+    # per child gives them the SAME colour (still no per-slab cue) and renders it
+    # correctly; physics material on the collider is also where PhysX reads it.
+    sf = float(rng.uniform(*config.static_friction_range))
+    df = float(rng.uniform(*config.dynamic_friction_range))
+    rest = float(rng.uniform(*config.restitution_range))
+    roughness, metallic = _sample_roughness_metallic(rng, config)
+    pbr = OmniPBR(prim_path=f"{prim_path}/visual_material", color=np.asarray(color, dtype=np.float32))
+    pbr.set_reflection_roughness(roughness)
+    pbr.set_metallic_constant(metallic)
+    phys_mat = PhysicsMaterial(
+        prim_path=f"{prim_path}/physics_material",
+        static_friction=sf, dynamic_friction=df, restitution=rest,
+    )
+    for cube_prim in child_prims:
+        _bind_material(cube_prim, pbr.material)
+        _bind_material(cube_prim, phys_mat.material, purpose="physics")
+    apply_class_label(parent_prim, name)
+
+    body = world.scene.add(RigidPrim(
+        prim_path=prim_path, name=name, position=position, orientation=orientation,
+    ))
+
+    spec = {
+        "id": i + 1,
+        "name": name,
+        "kind": "composite",
+        "shape": "cuboid",
+        "asset_url": None,
+        "dims": [float(x) for x in dims],
+        "color_rgb": [float(c) for c in color],
+        "roughness": roughness,
+        "metallic": metallic,
+        "static_friction": sf,
+        "dynamic_friction": df,
+        "restitution": rest,
+        "split_axis": split_axis,
+        "n_parts": n_parts,
+        "parts": part_specs,
+        "mass": total_mass,
+        "com_local_analytic": [float(x) for x in com_local_analytic],
+        "init_position_world": [float(x) for x in position],
+        "init_orientation_world": (
+            None if orientation is None else [float(x) for x in orientation]
+        ),
+    }
+    return body, spec
+
+
+def spawn_dynamic_body(world, rng, config, i, shape, dims, position,
+                       color=None, orientation=None, composite=False):
+    """Dispatch one dynamic body to the primitive (W2) or composite (W5) path.
+
+    Shared by every scenario so the composite-vs-primitive branch lives in one
+    place. Composites require a cuboid `dims` (the bbox); callers force
+    `shape="cuboid"` when `composite=True`.
+    """
+    if composite:
+        return spawn_composite_body(
+            world, rng, config, i, dims, position, color=color, orientation=orientation,
+        )
+    return spawn_body(
+        world, rng, config, i, shape, dims, position, color=color, orientation=orientation,
+    )
+
+
 def build_random_bodies(world, rng, config, n_bodies, xy_range=None, height_range=None):
     """Sample shapes, dims, colors, positions, frictions; spawn `n_bodies`.
 
@@ -441,13 +637,22 @@ def build_random_bodies(world, rng, config, n_bodies, xy_range=None, height_rang
     `config.init_height_range` respectively, but scenario builders can pass
     different ranges (e.g. spawn above a ramp's footprint).
 
+    Each body is independently a composite with probability `config.composite_frac`
+    (W5); a composite is forced to a cuboid bbox so its bounding radius /
+    non-overlap placement is identical to a primitive cuboid's. The rest of the
+    pipeline can't tell the two apart (both advertise shape="cuboid").
+
     Returns (bodies, body_specs). Returns (None, None) if position rejection
     sampling fails — caller should re-seed.
     """
     xy_range = xy_range if xy_range is not None else config.init_xy_range
     height_range = height_range if height_range is not None else config.init_height_range
 
-    shapes = [rng.choice(config.shape_choices).item() for _ in range(n_bodies)]
+    composite_flags = [bool(rng.uniform() < config.composite_frac) for _ in range(n_bodies)]
+    shapes = [
+        "cuboid" if composite_flags[i] else rng.choice(config.shape_choices).item()
+        for i in range(n_bodies)
+    ]
     dims_list = [sample_shape_dims(rng, s, config.scale_range) for s in shapes]
     radii = [bounding_radius(s, d) for s, d in zip(shapes, dims_list)]
 
@@ -460,8 +665,9 @@ def build_random_bodies(world, rng, config, n_bodies, xy_range=None, height_rang
     bodies = []
     specs = []
     for i in range(n_bodies):
-        body, spec = spawn_body(
+        body, spec = spawn_dynamic_body(
             world, rng, config, i, shapes[i], dims_list[i], positions[i],
+            composite=composite_flags[i],
         )
         bodies.append(body)
         specs.append(spec)

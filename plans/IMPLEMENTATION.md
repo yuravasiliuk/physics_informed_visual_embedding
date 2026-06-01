@@ -98,8 +98,19 @@ before any scale generation; the rest are rewrite-and-rerun.*):
 - ✅ **W2 authored offset CoM / W3 observability scenarios** (physics-diversification.md).
   Per-body scale-corrected offset CoM authored in `spawn_body` (CoM-offset label
   now has real variance; verified to ~2 nm); new `topple` + `collide` scenarios
-  make CoM/mass-ratio observable. W5 (composite glued bodies) parked until the
-  authored path is trusted in a scale batch.
+  make CoM/mass-ratio observable.
+- ✅ **W5 composite glued bodies** (physics-diversification.md W5). Completes the
+  W1–W5 physics-fidelity sub-plan. `body_factory.spawn_composite_body` builds a
+  uniform-colour cuboid internally split into 2–3 density slabs
+  (`config.composite_frac=0.3`); PhysX integrates the emergent mass/CoM, labels
+  are closed-form `ΣρV` / `ΣρV·t/ΣρV`, R8-clean. Wired into `build_random_bodies`
+  + `topple`/`collide` via `spawn_dynamic_body`. **`composite` verify case PASSED**
+  (mass err 8e-9, CoM err 5 nm). Smoke run confirmed labels on the production path
+  and caught a material bug (parent-Xform OmniPBR binding didn't reach the child
+  Cubes → grey composites), **fixed** by binding materials per child; re-run
+  confirms coloured composites indistinguishable from primitive cuboids
+  (saturation 0.40 vs 0.38). **Mesh-asset bodies (W5b) deferred** — no closed-form
+  GT for a mesh's CoM.
 - 🟡 **§14 engage resolution decoupling** — the `save_resolution` knob exists but
   defaults to 1024²; dropping labels to ~256² is the ÷16 disk lever (and resolves
   the #1 lossy-RGB debate). Set before the P1 batch. Caveat: target res depends on

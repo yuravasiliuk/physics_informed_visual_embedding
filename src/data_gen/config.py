@@ -85,6 +85,16 @@ class ClipConfig:
     # identically zero. 0.3 keeps the CoM well inside the collision volume
     # (sphere worst case: 0.3*sqrt(3)*r ~= 0.52 r < r). Appearance gives no cue.
     com_offset_frac: float = 0.3
+    # Composite glued bodies (physics-diversification.md W5). A fraction of
+    # dynamic bodies are built as a uniform-colour cuboid internally split into
+    # 2-3 contiguous density slabs, so the offset CoM *emerges* from a real mass
+    # distribution PhysX integrates (mass=ΣρV, com=ΣρV·t/ΣρV — closed-form,
+    # verified). Density asymmetry is invisible (one shared material) — the CoM
+    # is recoverable only from geometry + dynamics, never pixels (R8). Per-slab
+    # density reuses density_range above; the wide range creates the asymmetry.
+    composite_frac: float = 0.3                  # P(a dynamic body is a composite)
+    composite_n_parts_range: tuple = (2, 3)      # inclusive slab count along one axis
+    composite_split_min_frac: float = 0.2        # min fraction of the split axis per slab
     init_xy_range: tuple = (-0.3, 0.3)
     init_height_range: tuple = (0.4, 1.2)
     init_ang_vel_range: tuple = (-2.0, 2.0)                                   # rad/s, uniform per axis

@@ -33,10 +33,20 @@ below use only constant/relative/body-local quantities.
                       per-body state records stay matched to the right body
                       (no body-index <-> label swap).
 
-  D. production_cam  — satisfied implicitly: every case above runs at the
+  D. composite      — composite glued body through the PRODUCTION path
+                      (body_factory.spawn_composite_body, W5): a cuboid split
+                      into density slabs. Asserts PhysX's integrated mass / CoM
+                      equal the analytic ΣρV / ΣρV·t form the label assumes —
+                      the per-shape-density composition is the one uncertain
+                      runtime behaviour. Same xy-constant / gravity trajectory
+                      sanity as offset_com.
+
+  E. production_cam  — satisfied implicitly: every case above runs at the
                       production camera pose.
 
-Out of scope (no clean closed form): general tumbling, PhysX CoM on meshes.
+Out of scope (no clean closed form): general tumbling (Euler precession),
+PhysX CoM on real meshes, and the composite *inertia* tensor (PhysX-computed,
+no closed form — only mass + CoM are verified).
 
     ${ISAAC_SIM}/python.sh src/data_gen/verify_physics_labels.py \
         --result ~/data/verify_physics_labels
@@ -265,6 +275,100 @@ def case_offset_com(world, config, R_cw, cam_pos, q_cw, seed):
     }
 
 
+# --- case D: composite glued body (W5) --------------------------------------
+
+def case_composite(world, config, R_cw, cam_pos, q_cw, seed):
+    """Composite built through the PRODUCTION path (body_factory.
+    spawn_composite_body, W5): a uniform-colour cuboid internally split into
+    density slabs. PhysX integrates the slab densities into the body mass/CoM;
+    the analytic label is mass=ΣρV, com=ΣρV·t/ΣρV. This case proves PhysX agrees
+    with that formula — the one genuinely uncertain runtime behaviour W5 leans
+    on (per-shape density composition into a single rigid body).
+
+    All checks are body-local / frame-free or relative, so warmup-independent:
+      * get_mass() == Σ slab masses (the analytic composite mass), and
+      * read_local_com() == ΣρV·t/ΣρV (the analytic offset, recomputed
+        independently here from the logged per-slab parts), and
+      * the reconstructed world CoM has constant xy under spin (no get_world_pose
+        double-count) and a z second difference of -g·dt² (constant gravity).
+    """
+    rng = np.random.default_rng(seed)
+    omega = 3.0
+    side = 0.4
+    start = np.array([0.0, 0.0, 1.2])
+    # Force a clean 2-slab split for an interpretable, single-axis CoM offset.
+    case_config = dataclasses.replace(config, composite_n_parts_range=(2, 2))
+    body, spec = body_factory.spawn_composite_body(
+        world, rng, case_config, 0, (side, side, side), start,
+    )
+
+    # Independent analytic recompute from the logged parts (don't just trust
+    # spec["com_local_analytic"] — recompute mass=ΣρV, com=ΣρV·t/ΣρV here).
+    parts = spec["parts"]
+    mass_analytic = float(sum(p["mass"] for p in parts))
+    com_analytic = np.sum(
+        [p["mass"] * np.asarray(p["offset_local"]) for p in parts], axis=0,
+    ) / mass_analytic
+
+    init_v = [(np.zeros(3), np.array([0.0, 0.0, omega]))]
+    cam_frames, cam_recs = simulate_clip(
+        world, [body], init_v, [_annots(config)],
+        config, [(R_cw, cam_pos, q_cw)],
+    )
+    frames, recs = cam_frames[0], cam_recs[0]
+
+    # (1) THE label checks: PhysX-integrated mass / CoM == the analytic ΣρV form.
+    mass_measured = float(body.get_mass())
+    com_measured = read_local_com(body)
+    mass_rel_err = abs(mass_measured - mass_analytic) / mass_analytic
+    com_label_err = float(np.linalg.norm(com_measured - com_analytic))
+
+    # (2) Trajectory reconstruction sanity (as in offset_com): xy of the world
+    # CoM is constant under spin, z tracks constant gravity.
+    air = _airborne_mask(config, bottom_height_m=start[2] - side / 2.0)
+    idx = np.where(air)[0]
+    com_world = np.stack([
+        _world_from_cam_point(r["com_camera"], R_cw, cam_pos)
+        for r in _records_for(recs, body.name)
+    ])
+    xy_std = float(np.linalg.norm(com_world[idx, :2].std(axis=0)))
+    dt = config.render_dt
+    zz = com_world[idx, 2]
+    if len(zz) >= 3:
+        second_diff = zz[2:] - 2.0 * zz[1:-1] + zz[:-2]
+        accel_err = float(np.max(np.abs(second_diff - (-GRAVITY * dt * dt))))
+    else:
+        accel_err = float("inf")
+
+    passed = (len(idx) >= 4
+              and mass_rel_err < 1e-3
+              and com_label_err < COM_READBACK_TOL_M
+              and xy_std < 5e-3
+              and accel_err < 0.05 * GRAVITY * dt * dt)
+    return frames, recs, {
+        "case": "composite",
+        "airborne_frames": int(len(idx)),
+        "n_parts": spec["n_parts"],
+        "split_axis": spec["split_axis"],
+        "densities": [p["density"] for p in parts],
+        "mass_analytic": mass_analytic,
+        "mass_measured": mass_measured,
+        "mass_rel_err": mass_rel_err,
+        "com_local_analytic": com_analytic.tolist(),
+        "com_local_measured": com_measured.tolist(),
+        "com_offset_norm_m": float(np.linalg.norm(com_analytic)),
+        "com_label_err_m": com_label_err,
+        "traj_xy_std_m": xy_std,
+        "traj_accel_err": accel_err,
+        "passed": bool(passed),
+        "note": ("mass_rel_err / com_label_err prove PhysX integrates the "
+                 "per-slab densities into the body mass/CoM the way the analytic "
+                 "ΣρV label assumes. com_offset_norm_m should be clearly non-zero "
+                 "(invisible density asymmetry); if ~0 the two slabs drew similar "
+                 "densities — bump --seed for a stronger check."),
+    }
+
+
 # --- case C: two-body index alignment ---------------------------------------
 
 def case_two_body(world, config, R_cw, cam_pos, q_cw, seed):
@@ -311,6 +415,7 @@ CASES = {
     "spin_cuboid": case_spin_cuboid,
     "offset_com": case_offset_com,
     "two_body": case_two_body,
+    "composite": case_composite,
 }
 
 

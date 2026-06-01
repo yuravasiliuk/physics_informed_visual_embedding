@@ -627,7 +627,16 @@ def build_topple(world, rng, config):
     xy_range = _scaled(TOPPLE_XY_RANGE, scene_s)
 
     n = int(rng.integers(TOPPLE_N_RANGE[0], TOPPLE_N_RANGE[1] + 1))
-    shapes = [rng.choice(TOPPLE_SHAPES).item() for _ in range(n)]
+    # Composites (W5) topple too: their invisible density split biases *which*
+    # face the body lands on, on top of the W2 single-primitive offset. A
+    # composite is forced to a cuboid (TOPPLE_SHAPES are flat-based; the lean
+    # math is shape-agnostic via half_extents), so it stands and tips like any
+    # tall cuboid.
+    composite_flags = [bool(rng.uniform() < config.composite_frac) for _ in range(n)]
+    shapes = [
+        "cuboid" if composite_flags[i] else rng.choice(TOPPLE_SHAPES).item()
+        for i in range(n)
+    ]
     dims_list = [_sample_tall_dims(rng, sh, footprint_range, height_range) for sh in shapes]
     radii = [_topple_spacing_radius(shapes[i], dims_list[i]) for i in range(n)]
 
@@ -638,6 +647,7 @@ def build_topple(world, rng, config):
     while centers is None and n > 1:
         n -= 1
         shapes, dims_list, radii = shapes[:n], dims_list[:n], radii[:n]
+        composite_flags = composite_flags[:n]
         centers = _place_topple_centers(rng, radii, config, xy_range)
     if centers is None:
         raise _placement_failed("topple", n, config)
@@ -649,8 +659,9 @@ def build_topple(world, rng, config):
         pos, quat, ang_vel, lean_deg, tip_az = _topple_lean_pose(
             rng, shapes[i], dims_list[i], centers[i],
         )
-        body, spec = body_factory.spawn_body(
-            world, rng, config, i, shapes[i], dims_list[i], pos, orientation=quat,
+        body, spec = body_factory.spawn_dynamic_body(
+            world, rng, config, i, shapes[i], dims_list[i], pos,
+            orientation=quat, composite=composite_flags[i],
         )
         bodies.append(body)
         body_specs.append(spec)
@@ -703,8 +714,15 @@ def build_collide(world, rng, config):
     half_sep = float(rng.uniform(*_scaled(COLLIDE_HALF_SEP_RANGE, s)))
     z0 = float(rng.uniform(*_scaled(COLLIDE_HEIGHT_RANGE, s)))
 
-    shapes = [rng.choice(config.shape_choices).item() for _ in range(2)]
-    dims_list = [body_factory.sample_shape_dims(rng, s, config.scale_range) for s in shapes]
+    # Composites (W5) collide too: differing composite masses make the mass
+    # ratio observable on impact, the same target W1's density randomization
+    # serves. A composite is forced to a cuboid bbox.
+    composite_flags = [bool(rng.uniform() < config.composite_frac) for _ in range(2)]
+    shapes = [
+        "cuboid" if composite_flags[i] else rng.choice(config.shape_choices).item()
+        for i in range(2)
+    ]
+    dims_list = [body_factory.sample_shape_dims(rng, sh, config.scale_range) for sh in shapes]
 
     # Body 0 at +half_sep along u (moving -u), body 1 at -half_sep (moving +u).
     positions = [half_sep * u + np.array([0.0, 0.0, z0]),
@@ -715,8 +733,9 @@ def build_collide(world, rng, config):
     initial_velocities = []
     jitter = np.deg2rad(COLLIDE_AIM_JITTER_DEG)
     for i in range(2):
-        body, spec = body_factory.spawn_body(
+        body, spec = body_factory.spawn_dynamic_body(
             world, rng, config, i, shapes[i], dims_list[i], positions[i],
+            composite=composite_flags[i],
         )
         bodies.append(body)
         body_specs.append(spec)

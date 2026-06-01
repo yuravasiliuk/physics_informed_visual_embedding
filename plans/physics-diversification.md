@@ -169,13 +169,70 @@ the cases that exercise the risky label code, each with closed-form truth:
 
 Out of scope (no clean GT): general tumbling, PhysX CoM on real meshes.
 
-### W5 — Composite glued bodies *(Phase 2, after W1–W4 trusted)*
+### W5 — Composite glued bodies ✅ DONE — label gate + R8 colour check passed
+*Code in `body_factory.spawn_composite_body` + `_partition_cuboid` +
+`spawn_dynamic_body` dispatch; wired into `build_random_bodies` and into
+`topple`/`collide`; verify case `composite` added to `verify_physics_labels.py`.*
 
-- Fuse 2–3 primitives of differing density into one rigid body → emergent offset
-  CoM that PhysX computes and `read_local_com` reads. Appearance partially
-  correlates with CoM (more realistic than authored). GT = PhysX-computed (verify
-  the measured-vs-physical consistency, not a closed form). Parked until the
-  offset-CoM path is proven on the exact-GT authored case.
+**Label gate (W5 verify) PASSED:** PhysX integrates the per-slab densities
+exactly as the analytic `ΣρV` label assumes — `mass_rel_err = 8e-9`,
+`com_label_err = 5e-9 m` (5 nm), on a 2-slab box with a 42 mm CoM offset. So
+per-shape-density composition into one rigid body is confirmed (no body-prim-mass
+fallback needed). A `push` smoke run reproduced this on the production path
+(com/mass err 0.0 across 14 composites, composite share 33% ≈ `composite_frac`).
+
+**Material-binding fix (from the smoke run):** OmniPBR bound on the parent Xform
+did NOT propagate to the child Cubes for RTX rendering — composites rendered
+default grey (seg masks: blue body rendered ≈grey vs primitives keeping their
+hue). That grey is itself an R8 cue ("grey box == composite"), so the visual +
+physics materials are now bound to **each child gprim** (one shared material →
+still no per-slab cue, but the colour renders; physics material on the collider
+is also where PhysX reads it).
+
+**Re-run confirms the fix:** composites now render their sampled colour across
+scenarios (settle teal, drop green, topple teal/purple). R8 check — composite vs
+primitive *cuboid* rendered saturation is indistinguishable in the free-object
+set (0.40 vs 0.38, n=40/31); pooled+brightness-controlled there's a small ~0.04
+gap (composite 0.32 vs primitive 0.36) — accepted as negligible against the
+lighting/colour DR variance (likely a geometric shadowed-face effect from leaning
+slabs, not a material gap; a `displayColor` fallback on the child Cubes is the
+escape hatch if it ever proves to be a learnable cue). `collide` composite path
+not separately re-run (low risk — same `spawn_dynamic_body` dispatch as the
+confirmed `topple`/free paths). **W5 is the last item of the W1–W5
+physics-fidelity sub-plan; the sub-plan is complete.** Mesh-asset bodies remain
+as the deferred **W5b**.
+
+A composite is a **uniform-colour cuboid internally split into 2–3 contiguous
+density slabs** along one random axis (`config.composite_frac=0.3`,
+`composite_n_parts_range`, `composite_split_min_frac`). Each slab is a child
+`UsdGeom.Cube` collider carrying its own `density` (reuses `density_range`);
+PhysX integrates the union into the body mass / CoM / inertia at `world.reset()`.
+The parent Xform is the single rigid body (`RigidBodyAPI` + `RigidPrim`,
+mirroring `load_dynamic_asset`); one OmniPBR + one PhysicsMaterial are bound on
+the parent and inherited by the slabs, so the **density asymmetry is invisible**
+(R8 — CoM recoverable from geometry + dynamics only, never pixels). Decision
+change vs the original sketch below: parts are **uniform-coloured, not visually
+correlated with CoM** (the user's call — no appearance cue).
+
+- **Mechanism — slabs that tile a cuboid bbox**, chosen so the union *is* a
+  cuboid: a composite advertises `shape="cuboid"`, `dims=bbox`, so every existing
+  placement / lean / `preroll` path treats it exactly like a primitive cuboid and
+  **no call-site geometry math changed** — only the spawn dispatch.
+- **GT is closed-form for mass + CoM** (stronger than the "consistency only" this
+  section first assumed): non-overlapping slabs give `mass = Σ ρ_k V_k`,
+  `com_local = Σ ρ_k V_k t_k / mass` (logged as `com_local_analytic`; per-slab
+  `parts` logged too). The `composite` verify case asserts PhysX's post-reset
+  `get_mass` / `read_local_com` equal that analytic form — proving the one
+  uncertain behaviour (per-shape-density composition into one rigid body).
+  **Inertia stays PhysX-computed and unverified** (no clean closed form).
+- **Everywhere incl. topple/collide** (user's call): in `topple` the invisible
+  split biases *which face* the body lands on; in `collide` differing composite
+  masses make the mass ratio observable.
+- **Mesh-asset bodies deferred to W5b.** `asset_loader.load_dynamic_asset`
+  exists, but a mesh's CoM/inertia is PhysX-computed with no closed-form to
+  verify — a weaker GT tier. Ship the provable authored-composite core first.
+- Determinism: the per-body composite draw shifts the RNG stream, so old seeds
+  re-render (acceptable — W5 changes dynamics by design, regenerate-and-rerun).
 
 ## Correctness risk — RESOLVED (W4 offset_com)
 
@@ -190,11 +247,11 @@ reconstruction is correct. (Two *other* bugs surfaced instead — the unscaled
 
 ## Ground-truth contract
 
-| Quantity | Phase 1 (authored) | Phase 2 (composite) |
+| Quantity | Phase 1 (authored) | Phase 2 (composite, W5) |
 |---|---|---|
-| density / mass | authored, exact | per-part authored → exact composite mass |
-| CoM offset | authored, exact (closed-form verify) | PhysX-computed (`read_local_com`, consistency check) |
-| inertia | authored, exact | PhysX-computed |
+| density / mass | authored, exact | per-slab density authored → **exact** composite mass `ΣρV` (closed-form verify) |
+| CoM offset | authored, exact (closed-form verify) | **exact** `ΣρV·t/ΣρV` from non-overlapping slabs (closed-form verify vs `read_local_com`) |
+| inertia | PhysX-computed (scale-correct) | PhysX-computed, **unverified** (no clean closed form) |
 | ω, v, trajectory | sim ground truth (verify round-trip) | sim ground truth |
 
 ## Sequencing & gating
@@ -203,6 +260,6 @@ reconstruction is correct. (Two *other* bugs surfaced instead — the unscaled
   before them must be regenerated). They also gate the F-config / observability
   loss (P4) being meaningful.
 - W4 **precedes any GPU spend** (GATE A feasibility runs on these labels).
-- W5 is post-trust, parallel to early model work.
+- W5 ✅ done (was post-trust, parallel to early model work); W1–W5 complete.
 - Resolution (§14) and retry (#3) from the critique are independent and can land
   alongside, but are not blockers for *this* fidelity pass.
