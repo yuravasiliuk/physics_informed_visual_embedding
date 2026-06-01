@@ -131,13 +131,14 @@ class ClipConfig:
     sun_sat_range: tuple = (0.0, 0.2)              # near-white with slight warm tint
     sun_val_range: tuple = (0.85, 1.0)
 
-    # Isaac environment backdrops (warehouse/office/simple_room). Disabled by
-    # default after smoke_v0.3 clip_00008 showed `office.usd` rendering its floor
-    # textureless (MDL/material binding silently falls back to a default white
-    # shader); the procedural ground + sky path above gives more visual variety
-    # and no asset-resolution failure mode. Flip to True to re-enable env
-    # sampling (and the `--environment` CLI override still works either way).
-    use_isaac_envs: bool = False
+    # Isaac environment backdrops (warehouse / simple_room). Enabled: each clip
+    # samples uniformly over (discovered envs + "none"), mixing richly-textured
+    # backdrops with the bare procedural ground + sky. The one bad asset that
+    # motivated disabling this — office.usd, which rendered its floor textureless
+    # — is excluded at the library level (environments.CANDIDATE_ENVIRONMENTS),
+    # not by switching off every env. Set False to force procedural-only; the
+    # `--environment` CLI override works either way.
+    use_isaac_envs: bool = True
 
 
 # ============================================================================

@@ -379,9 +379,10 @@ def collect_clip(base_out, start_idx, config: ClipConfig, seed: int, env_overrid
     # suppresses both the procedural ground and the HDRI/fallback distant
     # light to avoid Z-fighting and double-bright scenes (plan §7 q3).
     # When `config.use_isaac_envs` is False we hard-pin "none" so every clip
-    # runs the procedural ground + sky path (smoke_v0.3 clip_00008 showed
-    # office.usd silently rendering its floor textureless). An explicit
-    # `--environment` CLI override still wins.
+    # runs the procedural ground + sky path. (The textureless-floor asset that
+    # once motivated disabling envs wholesale, office.usd, is now excluded at
+    # the library level instead — see environments.CANDIDATE_ENVIRONMENTS.) An
+    # explicit `--environment` CLI override still wins.
     effective_env_name = env_override
     if effective_env_name is None and not config.use_isaac_envs:
         effective_env_name = environments.NONE_NAME

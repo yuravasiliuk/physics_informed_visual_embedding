@@ -1,4 +1,4 @@
-"""Isaac Sim environment backdrops — warehouse / room / office USDs.
+"""Isaac Sim environment backdrops — warehouse / room USDs.
 
 Tier 2 of `plans/isaac-asset-diversification.md`. Each clip samples one
 backdrop uniformly from (discovered envs + "none"). When a real env is
@@ -32,13 +32,18 @@ logger = logging.getLogger(__name__)
 
 # (name, relative_path) — uniform sampling for v0.1. Add weights here when
 # evidence shows one env dominates the visual distribution.
+#
+# office.usd is deliberately excluded: it renders its floor textureless (the
+# MDL/material binding silently falls back to a default white shader on our
+# local asset mirror), which is worse than the procedural ground. Warehouse +
+# simple_room resolve their materials correctly, so they stay. Re-add office
+# here once its floor material resolves (or ship the missing MDL).
 CANDIDATE_ENVIRONMENTS = [
     ("warehouse",                "/Isaac/Environments/Simple_Warehouse/warehouse.usd"),
     ("warehouse_full",           "/Isaac/Environments/Simple_Warehouse/full_warehouse.usd"),
     ("warehouse_with_forklifts", "/Isaac/Environments/Simple_Warehouse/warehouse_with_forklifts.usd"),
     ("warehouse_shelves",        "/Isaac/Environments/Simple_Warehouse/warehouse_multiple_shelves.usd"),
     ("simple_room",              "/Isaac/Environments/Simple_Room/simple_room.usd"),
-    ("office",                   "/Isaac/Environments/Office/office.usd"),
 ]
 
 ENV_PRIM_PATH = "/World/environment"
