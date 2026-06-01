@@ -32,6 +32,25 @@ import asset_loader
 import body_factory
 import seg_labels
 import static_geometry
+from config import (
+    BODY_SCALE_REFERENCE,
+    ROLL_RAMP_LENGTH, ROLL_RAMP_WIDTH, ROLL_ANGLE_RANGE_DEG,
+    ROLL_SPAWN_XY_RANGE, ROLL_SPAWN_HEIGHT_RANGE,
+    THROW_SPEED_RANGE, THROW_UP_RANGE,
+    PLATFORM_LENGTH, PLATFORM_WIDTH, PLATFORM_HEIGHT,
+    PLATFORM_SPAWN_XY_RANGE, PLATFORM_SPAWN_HEIGHT_RANGE,
+    BOWL_INNER_LENGTH, BOWL_INNER_WIDTH, BOWL_HEIGHT, BOWL_WALL_THICKNESS,
+    SETTLE_SPAWN_XY_RANGE, SETTLE_SPAWN_HEIGHT_RANGE,
+    PUSH_SPEED_RANGE, PUSH_SPAWN_XY_RANGE, PUSH_SPAWN_HEIGHT_RANGE,
+    CLUTTERED_N_STATIC_RANGE, CLUTTERED_STATIC_XY_RANGE,
+    CLUTTERED_STATIC_RADIUS_MARGIN, CLUTTERED_DYNAMIC_XY_RANGE,
+    CLUTTERED_DYNAMIC_HEIGHT_RANGE,
+    TOPPLE_N_RANGE, TOPPLE_FOOTPRINT_RANGE, TOPPLE_HEIGHT_RANGE,
+    TOPPLE_KICK_ANGVEL_RANGE, TOPPLE_LEAN_MARGIN_DEG, TOPPLE_TIP_JITTER_DEG,
+    TOPPLE_XY_RANGE, TOPPLE_GROUND_CLEARANCE, TOPPLE_SHAPES,
+    COLLIDE_HALF_SEP_RANGE, COLLIDE_SPEED_RANGE, COLLIDE_HEIGHT_RANGE,
+    COLLIDE_AIM_JITTER_DEG,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -60,6 +79,22 @@ def _placement_failed(scenario_name: str, n_bodies: int, config):
     )
 
 
+def _scene_scale(config):
+    """Uniform factor applied to every spawn footprint and procedural static
+    asset so larger bodies (env scenes, scale_range_env) keep the same relative
+    proportions instead of overflowing their spawn box (camera-framing-fix.md
+    Stage 3). Exactly 1.0 at the tuned reference scale, so non-env scenes are
+    byte-for-byte unchanged."""
+    return max(1.0, config.scale_range[1] / BODY_SCALE_REFERENCE)
+
+
+def _scaled(value, s):
+    """Scale a scalar or a (lo, hi) range tuple by `s`."""
+    if isinstance(value, (tuple, list)):
+        return tuple(float(v) * s for v in value)
+    return float(value) * s
+
+
 # --- drop -------------------------------------------------------------------
 
 def build_drop(world, rng, config):
@@ -69,8 +104,13 @@ def build_drop(world, rng, config):
     default ground plane added by the caller).
     """
     n = _sample_n_bodies(rng, config)
+    s = _scene_scale(config)
 
-    bodies, body_specs = body_factory.build_random_bodies(world, rng, config, n)
+    bodies, body_specs = body_factory.build_random_bodies(
+        world, rng, config, n,
+        xy_range=_scaled(config.init_xy_range, s),
+        height_range=_scaled(config.init_height_range, s),
+    )
     if bodies is None:
         raise _placement_failed("drop", n, config)
 
@@ -83,12 +123,7 @@ def build_drop(world, rng, config):
 
 
 # --- roll -------------------------------------------------------------------
-
-ROLL_RAMP_LENGTH = 0.6
-ROLL_RAMP_WIDTH = 0.6
-ROLL_ANGLE_RANGE_DEG = (15.0, 30.0)
-ROLL_SPAWN_XY_RANGE = (-0.2, 0.2)
-ROLL_SPAWN_HEIGHT_RANGE = (0.6, 1.0)
+# Tunables: config.ROLL_*
 
 
 def build_roll(world, rng, config):
@@ -98,20 +133,23 @@ def build_roll(world, rng, config):
     y ∈ (-0.3, +0.3) and x ∈ (-0.3, +0.3). Bodies spawn in a smaller
     airborne box centered above the wedge.
     """
+    s = _scene_scale(config)
+    ramp_length = ROLL_RAMP_LENGTH * s
+    ramp_width = ROLL_RAMP_WIDTH * s
     angle_deg = float(rng.uniform(*ROLL_ANGLE_RANGE_DEG))
-    ramp_base = np.array([0.0, -ROLL_RAMP_LENGTH * 0.5, 0.0])
+    ramp_base = np.array([0.0, -ramp_length * 0.5, 0.0])
 
     static_geometry.make_ramp(
         world, prim_path="/World/ramp", name="ramp",
         base_position=ramp_base, angle_deg=angle_deg,
-        length=ROLL_RAMP_LENGTH, width=ROLL_RAMP_WIDTH,
+        length=ramp_length, width=ramp_width,
     )
 
     n = _sample_n_bodies(rng, config)
     bodies, body_specs = body_factory.build_random_bodies(
         world, rng, config, n,
-        xy_range=ROLL_SPAWN_XY_RANGE,
-        height_range=ROLL_SPAWN_HEIGHT_RANGE,
+        xy_range=_scaled(ROLL_SPAWN_XY_RANGE, s),
+        height_range=_scaled(ROLL_SPAWN_HEIGHT_RANGE, s),
     )
     if bodies is None:
         raise _placement_failed("roll", n, config)
@@ -127,9 +165,9 @@ def build_roll(world, rng, config):
             "prim_path": "/World/ramp",
             "base_position_world": ramp_base.tolist(),
             "angle_deg": angle_deg,
-            "length": ROLL_RAMP_LENGTH,
-            "width": ROLL_RAMP_WIDTH,
-            "height": ROLL_RAMP_LENGTH * float(np.tan(np.deg2rad(angle_deg))),
+            "length": ramp_length,
+            "width": ramp_width,
+            "height": ramp_length * float(np.tan(np.deg2rad(angle_deg))),
         }],
         "scenario_specs": {"ramp_angle_deg": angle_deg},
     }
@@ -137,9 +175,7 @@ def build_roll(world, rng, config):
 
 
 # --- throw ------------------------------------------------------------------
-
-THROW_SPEED_RANGE = (0.5, 12.0)        # m/s, horizontal magnitude
-THROW_UP_RANGE = (0.0, 10.5)           # m/s, +Z component
+# Tunables: config.THROW_*
 
 
 def _sample_throw_velocity(rng):
@@ -162,8 +198,13 @@ def build_throw(world, rng, config):
     pure gravity" shortcut that `drop` admits.
     """
     n = _sample_n_bodies(rng, config)
+    s = _scene_scale(config)
 
-    bodies, body_specs = body_factory.build_random_bodies(world, rng, config, n)
+    bodies, body_specs = body_factory.build_random_bodies(
+        world, rng, config, n,
+        xy_range=_scaled(config.init_xy_range, s),
+        height_range=_scaled(config.init_height_range, s),
+    )
     if bodies is None:
         raise _placement_failed("throw", n, config)
 
@@ -182,12 +223,7 @@ def build_throw(world, rng, config):
 
 
 # --- drop_on_platform -------------------------------------------------------
-
-PLATFORM_LENGTH = 0.4
-PLATFORM_WIDTH = 0.4
-PLATFORM_HEIGHT = 0.10
-PLATFORM_SPAWN_XY_RANGE = (-0.25, 0.25)     # wider than platform half-width=0.2
-PLATFORM_SPAWN_HEIGHT_RANGE = (0.5, 1.0)
+# Tunables: config.PLATFORM_*
 
 
 def build_drop_on_platform(world, rng, config):
@@ -197,17 +233,21 @@ def build_drop_on_platform(world, rng, config):
     bodies hit the edge or miss entirely — produces bounce + spin variety
     that a flat ground impact does not.
     """
+    s = _scene_scale(config)
+    plat_length = PLATFORM_LENGTH * s
+    plat_width = PLATFORM_WIDTH * s
+    plat_height = PLATFORM_HEIGHT * s
     static_geometry.make_platform(
         world, prim_path="/World/platform", name="platform",
         base_position=np.zeros(3),
-        length=PLATFORM_LENGTH, width=PLATFORM_WIDTH, height=PLATFORM_HEIGHT,
+        length=plat_length, width=plat_width, height=plat_height,
     )
 
     n = _sample_n_bodies(rng, config)
     bodies, body_specs = body_factory.build_random_bodies(
         world, rng, config, n,
-        xy_range=PLATFORM_SPAWN_XY_RANGE,
-        height_range=PLATFORM_SPAWN_HEIGHT_RANGE,
+        xy_range=_scaled(PLATFORM_SPAWN_XY_RANGE, s),
+        height_range=_scaled(PLATFORM_SPAWN_HEIGHT_RANGE, s),
     )
     if bodies is None:
         raise _placement_failed("drop_on_platform", n, config)
@@ -221,9 +261,9 @@ def build_drop_on_platform(world, rng, config):
             "type": "platform",
             "prim_path": "/World/platform",
             "base_position_world": [0.0, 0.0, 0.0],
-            "length": PLATFORM_LENGTH,
-            "width": PLATFORM_WIDTH,
-            "height": PLATFORM_HEIGHT,
+            "length": plat_length,
+            "width": plat_width,
+            "height": plat_height,
         }],
         "scenario_specs": {},
     }
@@ -231,13 +271,7 @@ def build_drop_on_platform(world, rng, config):
 
 
 # --- settle -----------------------------------------------------------------
-
-BOWL_INNER_LENGTH = 0.9
-BOWL_INNER_WIDTH = 0.9
-BOWL_HEIGHT = 0.25
-BOWL_WALL_THICKNESS = 0.02
-SETTLE_SPAWN_XY_RANGE = (-0.27, 0.27)        # inside bowl, ~0.05 m wall clearance for max-radius bodies
-SETTLE_SPAWN_HEIGHT_RANGE = (0.5, 1.5)       # 1.0 m vertical headroom for rejection sampling
+# Tunables: config.BOWL_*, config.SETTLE_*
 
 
 def build_settle(world, rng, config):
@@ -247,18 +281,23 @@ def build_settle(world, rng, config):
     config.n_bodies_range's upper bound (8) without exhausting attempts.
     Smaller interiors fail for runs that happen to sample many large cuboids.
     """
+    s = _scene_scale(config)
+    bowl_length = BOWL_INNER_LENGTH * s
+    bowl_width = BOWL_INNER_WIDTH * s
+    bowl_height = BOWL_HEIGHT * s
+    bowl_thickness = BOWL_WALL_THICKNESS * s
     static_geometry.make_bowl(
         world, prim_path="/World/bowl", name="bowl",
         base_position=np.zeros(3),
-        inner_length=BOWL_INNER_LENGTH, inner_width=BOWL_INNER_WIDTH,
-        height=BOWL_HEIGHT, wall_thickness=BOWL_WALL_THICKNESS,
+        inner_length=bowl_length, inner_width=bowl_width,
+        height=bowl_height, wall_thickness=bowl_thickness,
     )
 
     n = _sample_n_bodies(rng, config)
     bodies, body_specs = body_factory.build_random_bodies(
         world, rng, config, n,
-        xy_range=SETTLE_SPAWN_XY_RANGE,
-        height_range=SETTLE_SPAWN_HEIGHT_RANGE,
+        xy_range=_scaled(SETTLE_SPAWN_XY_RANGE, s),
+        height_range=_scaled(SETTLE_SPAWN_HEIGHT_RANGE, s),
     )
     if bodies is None:
         raise _placement_failed("settle", n, config)
@@ -272,10 +311,10 @@ def build_settle(world, rng, config):
             "type": "bowl",
             "prim_path": "/World/bowl",
             "base_position_world": [0.0, 0.0, 0.0],
-            "inner_length": BOWL_INNER_LENGTH,
-            "inner_width": BOWL_INNER_WIDTH,
-            "height": BOWL_HEIGHT,
-            "wall_thickness": BOWL_WALL_THICKNESS,
+            "inner_length": bowl_length,
+            "inner_width": bowl_width,
+            "height": bowl_height,
+            "wall_thickness": bowl_thickness,
         }],
         "scenario_specs": {},
     }
@@ -283,11 +322,7 @@ def build_settle(world, rng, config):
 
 
 # --- push -------------------------------------------------------------------
-
-PUSH_SPEED_RANGE = (1.5, 3.5)                # m/s, pure horizontal
-PUSH_SPAWN_XY_RANGE = (-0.3, 0.3)
-PUSH_SPAWN_HEIGHT_RANGE = (0.15, 0.25)       # half-extent ≲0.075 → no spawn-time
-                                             # ground penetration even for max-scale cuboids
+# Tunables: config.PUSH_*
 # Speed range is intentionally higher than `throw`: friction kills sliding
 # motion as `v²/(2μg)`, so with friction ~0.3-0.8 and gravity, anything below
 # ~1 m/s decelerates to a stop in <100 ms and the clip looks like a drop.
@@ -310,10 +345,11 @@ def build_push(world, rng, config):
     sliding + rolling rather than parabolic flight.
     """
     n = _sample_n_bodies(rng, config)
+    s = _scene_scale(config)
     bodies, body_specs = body_factory.build_random_bodies(
         world, rng, config, n,
-        xy_range=PUSH_SPAWN_XY_RANGE,
-        height_range=PUSH_SPAWN_HEIGHT_RANGE,
+        xy_range=_scaled(PUSH_SPAWN_XY_RANGE, s),
+        height_range=_scaled(PUSH_SPAWN_HEIGHT_RANGE, s),
     )
     if bodies is None:
         raise _placement_failed("push", n, config)
@@ -330,12 +366,7 @@ def build_push(world, rng, config):
 
 
 # --- cluttered --------------------------------------------------------------
-
-CLUTTERED_N_STATIC_RANGE = (2, 5)                # inclusive
-CLUTTERED_STATIC_XY_RANGE = (-0.5, 0.5)          # wider than the body footprint
-CLUTTERED_STATIC_RADIUS_MARGIN = 0.05            # extra gap between circumscribed circles, m
-CLUTTERED_DYNAMIC_XY_RANGE = (-0.4, 0.4)
-CLUTTERED_DYNAMIC_HEIGHT_RANGE = (1.0, 1.5)      # well above typical asset heights (~0.5 m)
+# Tunables: config.CLUTTERED_*
 
 
 def _footprint_radius(footprint_xy: tuple) -> float:
@@ -440,10 +471,13 @@ def build_cluttered(world, rng, config):
         })
 
     n = _sample_n_bodies(rng, config)
+    # Static props are real fixed-size assets — only the dynamic-body spawn box
+    # scales with body size.
+    s = _scene_scale(config)
     bodies, body_specs = body_factory.build_random_bodies(
         world, rng, config, n,
-        xy_range=CLUTTERED_DYNAMIC_XY_RANGE,
-        height_range=CLUTTERED_DYNAMIC_HEIGHT_RANGE,
+        xy_range=_scaled(CLUTTERED_DYNAMIC_XY_RANGE, s),
+        height_range=_scaled(CLUTTERED_DYNAMIC_HEIGHT_RANGE, s),
     )
     if bodies is None:
         raise _placement_failed("cluttered", n, config)
@@ -478,32 +512,25 @@ def build_cluttered(world, rng, config):
 # past theta_crit guarantees a visible topple every clip without a large kick
 # that would swamp the CoM-direction signal.
 
-TOPPLE_N_RANGE = (1, 2)                      # inclusive — keep it clean/observable
-TOPPLE_FOOTPRINT_RANGE = (0.05, 0.09)        # small base side / diameter, m
-TOPPLE_HEIGHT_RANGE = (0.25, 0.45)           # tall, m — aspect ratio ~3-9:1
-TOPPLE_KICK_ANGVEL_RANGE = (0.3, 1.0)        # rad/s, small assist in the tip direction (gravity does the work)
-TOPPLE_LEAN_MARGIN_DEG = (3.0, 8.0)          # lean this far PAST theta_crit so it always tips
-TOPPLE_TIP_JITTER_DEG = 15.0                 # ± jitter on a cuboid's tip-over direction
-TOPPLE_XY_RANGE = (-0.30, 0.30)
-TOPPLE_GROUND_CLEARANCE = 0.005              # spawn just clear of ground (no t=0 penetration)
-TOPPLE_SHAPES = ("cuboid", "cylinder")       # only shapes with a flat base to stand on
+# Tunables: config.TOPPLE_*
 
 
-def _sample_tall_dims(rng, shape):
+def _sample_tall_dims(rng, shape, footprint_range, height_range):
     """Tall, small-footprint dims so the body is marginally stable and topples.
 
-    Layout matches sample_shape_dims:
+    `footprint_range`/`height_range` are the (already scene-scaled) base-side/
+    diameter and height ranges. Layout matches sample_shape_dims:
         cuboid   -> (sx, sy, sz)  small sx,sy; tall sz
         cylinder -> (r, h)        small r; tall h
     """
     if shape == "cuboid":
-        sx = float(rng.uniform(*TOPPLE_FOOTPRINT_RANGE))
-        sy = float(rng.uniform(*TOPPLE_FOOTPRINT_RANGE))
-        sz = float(rng.uniform(*TOPPLE_HEIGHT_RANGE))
+        sx = float(rng.uniform(*footprint_range))
+        sy = float(rng.uniform(*footprint_range))
+        sz = float(rng.uniform(*height_range))
         return (sx, sy, sz)
     # cylinder: footprint range is a diameter, so radius is half of it
-    r = 0.5 * float(rng.uniform(*TOPPLE_FOOTPRINT_RANGE))
-    h = float(rng.uniform(*TOPPLE_HEIGHT_RANGE))
+    r = 0.5 * float(rng.uniform(*footprint_range))
+    h = float(rng.uniform(*height_range))
     return (r, h)
 
 
@@ -571,12 +598,12 @@ def _topple_lean_pose(rng, shape, dims, center_xy):
     return position, quat, ang_vel, float(np.rad2deg(alpha)), float(phi % (2.0 * np.pi))
 
 
-def _place_topple_centers(rng, radii, config):
+def _place_topple_centers(rng, radii, config, xy_range):
     """Rejection-sample distinct XY base centers (z is set later by the lean
     pose, so we can't reuse sample_non_overlapping_positions which samples z).
     Returns a list of (2,) arrays, or None if any body can't be placed within
     pose_rejection_max_attempts."""
-    xy_lo, xy_hi = TOPPLE_XY_RANGE
+    xy_lo, xy_hi = xy_range
     centers = []
     for r_i in radii:
         for _ in range(config.pose_rejection_max_attempts):
@@ -594,19 +621,24 @@ def _place_topple_centers(rng, radii, config):
 
 def build_topple(world, rng, config):
     """1-2 tall bodies spawned leaning past their tip angle; gravity topples them (W3a)."""
+    scene_s = _scene_scale(config)
+    footprint_range = _scaled(TOPPLE_FOOTPRINT_RANGE, scene_s)
+    height_range = _scaled(TOPPLE_HEIGHT_RANGE, scene_s)
+    xy_range = _scaled(TOPPLE_XY_RANGE, scene_s)
+
     n = int(rng.integers(TOPPLE_N_RANGE[0], TOPPLE_N_RANGE[1] + 1))
     shapes = [rng.choice(TOPPLE_SHAPES).item() for _ in range(n)]
-    dims_list = [_sample_tall_dims(rng, s) for s in shapes]
+    dims_list = [_sample_tall_dims(rng, sh, footprint_range, height_range) for sh in shapes]
     radii = [_topple_spacing_radius(shapes[i], dims_list[i]) for i in range(n)]
 
     # Degrade gracefully rather than hard-failing: if N bodies won't fit in the
     # spawn box, drop one and retry (N=1 always places). Removes the placement
     # RuntimeError on unlucky two-large-body draws.
-    centers = _place_topple_centers(rng, radii, config)
+    centers = _place_topple_centers(rng, radii, config, xy_range)
     while centers is None and n > 1:
         n -= 1
         shapes, dims_list, radii = shapes[:n], dims_list[:n], radii[:n]
-        centers = _place_topple_centers(rng, radii, config)
+        centers = _place_topple_centers(rng, radii, config, xy_range)
     if centers is None:
         raise _placement_failed("topple", n, config)
 
@@ -631,8 +663,8 @@ def build_topple(world, rng, config):
         "scenario_specs": {
             "kick_angvel_range": list(TOPPLE_KICK_ANGVEL_RANGE),
             "lean_margin_deg": list(TOPPLE_LEAN_MARGIN_DEG),
-            "footprint_range": list(TOPPLE_FOOTPRINT_RANGE),
-            "height_range": list(TOPPLE_HEIGHT_RANGE),
+            "footprint_range": list(footprint_range),
+            "height_range": list(height_range),
             "lean_deg": lean_degs,
             "tip_azimuth_rad": tip_azimuths,
         },
@@ -647,10 +679,7 @@ def build_topple(world, rng, config):
 # mass (now decoupled from volume by W1) becomes a learnable target rather than
 # a relabelling of visible size.
 
-COLLIDE_HALF_SEP_RANGE = (0.30, 0.42)        # m, each body's distance from origin
-COLLIDE_SPEED_RANGE = (1.5, 30.0)             # m/s, horizontal closing speed per body
-COLLIDE_HEIGHT_RANGE = (0.12, 0.22)          # m, shared spawn height of both centers
-COLLIDE_AIM_JITTER_DEG = 8.0                 # max ± aim jitter so it's not perfectly 1D
+# Tunables: config.COLLIDE_*
 
 
 def _rot_z(vec, ang):
@@ -668,10 +697,11 @@ def build_collide(world, rng, config):
     small per-body aim jitter, so most collisions are near-head-on but not a
     degenerate 1-D line every clip.
     """
+    s = _scene_scale(config)
     azimuth = rng.uniform(0.0, 2.0 * np.pi)
     u = np.array([np.cos(azimuth), np.sin(azimuth), 0.0])
-    half_sep = float(rng.uniform(*COLLIDE_HALF_SEP_RANGE))
-    z0 = float(rng.uniform(*COLLIDE_HEIGHT_RANGE))
+    half_sep = float(rng.uniform(*_scaled(COLLIDE_HALF_SEP_RANGE, s)))
+    z0 = float(rng.uniform(*_scaled(COLLIDE_HEIGHT_RANGE, s)))
 
     shapes = [rng.choice(config.shape_choices).item() for _ in range(2)]
     dims_list = [body_factory.sample_shape_dims(rng, s, config.scale_range) for s in shapes]
@@ -747,7 +777,7 @@ def build(scenario_name: str, world, rng, config):
     bodies, body_specs, scene_specs, initial_velocities = BUILDERS[scenario_name](
         world, rng, config,
     )
-    scene_specs.setdefault("scenario_specs", {})["observability_hint"] = (
-        OBSERVABILITY_HINT.get(scenario_name, "unknown")
-    )
+    specs = scene_specs.setdefault("scenario_specs", {})
+    specs["observability_hint"] = OBSERVABILITY_HINT.get(scenario_name, "unknown")
+    specs["scene_scale"] = _scene_scale(config)
     return bodies, body_specs, scene_specs, initial_velocities

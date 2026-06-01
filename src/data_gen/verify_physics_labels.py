@@ -69,7 +69,6 @@ import lighting
 from collect_clip import simulate_clip
 from seg_labels import apply_class_label
 from clip_capture import (
-    ClipConfig,
     build_metadata,
     make_annotators,
     quat_wxyz_mul,
@@ -78,6 +77,7 @@ from clip_capture import (
     save_clip,
     world_to_camera_frame,
 )
+from config import ClipConfig
 
 GRAVITY = 9.81
 DEFAULT_OUT = os.path.expanduser("~/data/verify_physics_labels")

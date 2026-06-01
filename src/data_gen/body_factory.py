@@ -25,6 +25,7 @@ from omni.isaac.core.objects import (
 )
 from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics
 
+from config import GRID_TEXTURE_CACHE
 from seg_labels import apply_class_label
 
 
@@ -291,9 +292,6 @@ def attach_pbr_material(body, prim_path, color, roughness, metallic):
     mat.set_reflection_roughness(float(roughness))
     mat.set_metallic_constant(float(metallic))
     body.apply_visual_material(mat)
-
-
-GRID_TEXTURE_CACHE = os.path.expanduser("~/.cache/sim_physics/grid_texture.png")
 
 
 def ensure_grid_texture(path=GRID_TEXTURE_CACHE, size=1024, cells=8, line_frac=0.04):

@@ -11,93 +11,20 @@ an initialized Kit session.
 """
 import json
 import os
-from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 import omni.replicator.core as rep
 
+from config import ClipConfig
 
-@dataclass(frozen=True)
-class ClipConfig:
-    """Per-clip generation parameters. Defaults follow §7 of plans/probe-dataset.md."""
-
-    # Capture
-    frame_count: int = 32                     # K — plan §7
-    resolution: tuple = (1024, 1024)            # (width, height) — render/capture res, plan §7
-    save_resolution: tuple = (1024, 1024)         # (width, height) saved rgb/depth/normals are
-                                                # downsampled to this; capture stays at `resolution`
-    physics_dt: float = 1.0 / 60.0            # physics step — plan §7 (60 Hz)
-    render_dt: float = 1.0 / 30.0             # render step — plan §7 (30 fps)
-    camera_position: tuple = (2.2, 2.2, 1.8)  # world frame — single-camera fallback (verify, legacy)
-    camera_look_at: tuple = (0.0, 0.0, 0.1)   # world frame — rig look-at base too
-
-    # Multi-view capture (scene-diversification.md §10, axis G). One physics
-    # rollout is rendered from `n_cameras` jittered viewpoints on a shell around
-    # the scene centroid and fanned out into n_cameras INDEPENDENT clips (each
-    # its own folder, single-camera contract unchanged). Physics steps once.
-    n_cameras: int = 7
-    camera_radius_range: tuple = (2.8, 3.6)        # m, distance from look-at
-    camera_elevation_range: tuple = (20.0, 55.0)   # deg, base band spread across the rig
-    camera_azimuth_jitter_deg: float = 12.0        # per-camera ± on the evenly-spaced azimuth
-    camera_elevation_jitter_deg: float = 8.0       # per-camera ± on the base elevation
-    camera_elevation_clamp_deg: tuple = (12.0, 68.0)  # keep above floor / below near-top-down NaN
-    camera_lookat_jitter: float = 0.08             # m, ± per-axis jitter on the look-at point
-
-    # Scene randomization
-    scenarios: tuple = (
-        "drop", "roll", "throw",
-        "drop_on_platform", "settle", "push",
-        "cluttered", "topple", "collide",
-    )                                                                         # uniform sampling per clip
-    n_bodies_range: tuple = (3, 8)                                            # inclusive
-    shape_choices: tuple = ("cuboid", "sphere", "cylinder", "capsule")
-    scale_range: tuple = (0.05, 0.15)                                         # m; per-axis (cuboid) or radius/height
-    color_hue_range: tuple = (0.0, 1.0)
-    color_sat_range: tuple = (0.5, 1.0)
-    color_val_range: tuple = (0.4, 0.9)
-    static_friction_range: tuple = (0.3, 0.8)
-    dynamic_friction_range: tuple = (0.3, 0.8)
-    restitution_range: tuple = (0.0, 0.4)
-    # Per-body density (kg/m^3), authored so mass is decoupled from visible
-    # volume (critique #7 / physics-diversification.md W1). ~styrofoam(200) →
-    # steel(8000). Without this, mass = 1000·volume and a "predict mass" probe
-    # only ever learns visible size.
-    density_range: tuple = (200.0, 8000.0)
-    # Per-body CoM offset as a fraction of each half-extent (W2 / R7). Authored
-    # via MassAPI so the CoM-offset label has real variance instead of being
-    # identically zero. 0.3 keeps the CoM well inside the collision volume
-    # (sphere worst case: 0.3*sqrt(3)*r ~= 0.52 r < r). Appearance gives no cue.
-    com_offset_frac: float = 0.3
-    init_xy_range: tuple = (-0.3, 0.3)
-    init_height_range: tuple = (0.4, 1.2)
-    init_ang_vel_range: tuple = (-2.0, 2.0)                                   # rad/s, uniform per axis
-    pose_rejection_max_attempts: int = 100
-
-    # PBR visual materials — Tier 3 (plan §5 / step 5.10).
-    roughness_range: tuple = (0.2, 0.9)
-    metallic_prob: float = 0.15
-    metallic_values: tuple = (0.8, 1.0)
-
-    # Ground colour — Tier 3. Greys with a slight tint (per RGB channel,
-    # uniform in this range). Texture-based ground materials and "room"
-    # enclosures (plan §5) deferred — they need external PBR assets.
-    ground_color_range: tuple = (0.25, 0.55)
-
-    # Ground grid texture (scene-diversification.md §10.4, axis D). A locally
-    # generated grid-line PNG bound to the ground via OmniPBR gives a
-    # translation/parallax cue the flat colour lacks. texture_scale (UV repeats)
-    # is randomized per clip for line-spacing variety; suppressed when an
-    # environment USD ships its own floor.
-    ground_grid_enabled: bool = True
-    ground_grid_tiling_range: tuple = (6.0, 16.0)  # UV repeats across the plane
-
-    # Lighting (HDRI). Empty `hdri_paths` = no-op, Isaac default lighting applies.
-    # Populate with file paths or nucleus URIs to enable HDRI randomization.
-    hdri_paths: tuple = ()
-    hdri_rotation_range_deg: tuple = (0.0, 360.0)
-    hdri_intensity: float = 1000.0
+# Camera intrinsics — the single source for both the live capture cameras
+# (make_annotators) and the framing-distance solver (framing_distance). Keep
+# them in lock-step. tan(HFOV/2) = (horizontal_aperture/2) / focal_length.
+_CAM_FOCAL_MM = 18.0
+_CAM_HORIZ_APERTURE_MM = 20.955
+_CAM_HALF_FOV_TAN = (_CAM_HORIZ_APERTURE_MM / 2.0) / _CAM_FOCAL_MM
 
 
 def make_annotators(camera_position, look_at, resolution, rp_name=None):
@@ -118,8 +45,8 @@ def make_annotators(camera_position, look_at, resolution, rp_name=None):
     camera = rep.create.camera(
         position=tuple(camera_position),
         look_at=tuple(look_at),
-        focal_length=18.0,
-        horizontal_aperture=20.955,
+        focal_length=_CAM_FOCAL_MM,
+        horizontal_aperture=_CAM_HORIZ_APERTURE_MM,
         clipping_range=(0.1, 100.0),
         f_stop=0.0,                  # 0 disables DoF; >0 enables defocus blur
         focus_distance=400.0,
@@ -142,39 +69,109 @@ def make_annotators(camera_position, look_at, resolution, rp_name=None):
     return annots
 
 
-def sample_camera_rig(rng, config):
-    """Sample `config.n_cameras` viewpoints on a shell around the scene centroid.
+def framing_distance(cloud_radius, config):
+    """Camera distance so a body cloud of radius `cloud_radius` fills
+    `config.frame_fill_frac` of the half-frame, clamped to
+    `config.camera_radius_clamp` (camera-framing-fix.md §4)."""
+    lo, hi = config.camera_radius_clamp
+    d = cloud_radius / max(config.frame_fill_frac * _CAM_HALF_FOV_TAN, 1e-6)
+    return float(np.clip(d, lo, hi))
 
-    Predefined rig + per-rollout jitter (scene-diversification.md §10.2): azimuths
-    are evenly spaced (with a per-rollout global rotation so the rig isn't
-    axis-aligned every clip) and jittered; base elevations are spread across
-    `camera_elevation_range` and jittered (clamped to keep the camera above the
-    floor and clear of the near-top-down NaN); radius and look-at are jittered
-    per camera. Returns a list of (camera_pos_world, look_at_world) float arrays.
-    """
+
+def rig_angle_centers(config, az0):
+    """Per-camera (azimuth_rad, elevation_deg) base angles for the rig: azimuths
+    evenly spaced around the full circle (globally rotated by `az0` so the rig
+    isn't axis-aligned every rollout) and elevations spread across
+    `camera_elevation_range`. Jitter is applied later in `sample_camera_pose`."""
     n = int(config.n_cameras)
-    look_base = np.asarray(config.camera_look_at, dtype=np.float64)
     el_lo, el_hi = config.camera_elevation_range
     base_elev = np.linspace(el_lo, el_hi, n) if n > 1 else np.array([(el_lo + el_hi) / 2.0])
-    az0 = rng.uniform(0.0, 2.0 * np.pi)
+    return [(az0 + 2.0 * np.pi * k / n, float(base_elev[k])) for k in range(n)]
+
+
+def sample_camera_pose(rng, config, centroid, cloud_radius, az_center, el_center_deg):
+    """One jittered (camera_pos_world, look_at_world) anchored on the body-cloud
+    `centroid` and framed by `cloud_radius`. Azimuth/elevation jitter the given
+    band centers; elevation is clamped to keep the camera off the floor and clear
+    of the near-top-down NaN (scene-diversification.md §10.2). Used both for the
+    initial rig proposal and for per-camera resampling during visibility gating.
+    """
     az_j = np.deg2rad(config.camera_azimuth_jitter_deg)
     el_j = config.camera_elevation_jitter_deg
     el_clamp_lo, el_clamp_hi = config.camera_elevation_clamp_deg
+    az = az_center + rng.uniform(-az_j, az_j)
+    el_deg = np.clip(el_center_deg + rng.uniform(-el_j, el_j), el_clamp_lo, el_clamp_hi)
+    el = np.deg2rad(el_deg)
+    d = framing_distance(cloud_radius, config)
+    look = np.asarray(centroid, dtype=np.float64) + rng.uniform(
+        -config.camera_lookat_jitter, config.camera_lookat_jitter, size=3,
+    )
+    offset = d * np.array([
+        np.cos(el) * np.cos(az),
+        np.cos(el) * np.sin(az),
+        np.sin(el),
+    ])
+    return look + offset, look
 
-    rig = []
-    for k in range(n):
-        az = az0 + 2.0 * np.pi * k / n + rng.uniform(-az_j, az_j)
-        el_deg = np.clip(base_elev[k] + rng.uniform(-el_j, el_j), el_clamp_lo, el_clamp_hi)
-        el = np.deg2rad(el_deg)
-        r = rng.uniform(*config.camera_radius_range)
-        look = look_base + rng.uniform(-config.camera_lookat_jitter, config.camera_lookat_jitter, size=3)
-        offset = r * np.array([
-            np.cos(el) * np.cos(az),
-            np.cos(el) * np.sin(az),
-            np.sin(el),
-        ])
-        rig.append((look + offset, look))
-    return rig
+
+def _body_seg_ids(seg_info):
+    """Seg IDs whose class label is a dynamic body (`body_NN`), read from a
+    semantic_segmentation annotator's `info` block. `idToLabels` may be a dict
+    or a JSON string depending on the Kit version; handle both."""
+    if not seg_info:
+        return []
+    mapping = seg_info.get("idToLabels", seg_info) if isinstance(seg_info, dict) else seg_info
+    if isinstance(mapping, str):
+        mapping = json.loads(mapping)
+    ids = []
+    for k, v in mapping.items():
+        cls = v.get("class") if isinstance(v, dict) else v
+        if isinstance(cls, str) and cls.startswith("body_"):
+            ids.append(int(k))
+    return ids
+
+
+def body_seg_coverage(seg_array, seg_info):
+    """Fraction of pixels in `seg_array` that belong to dynamic bodies."""
+    ids = _body_seg_ids(seg_info)
+    if not ids:
+        return 0.0
+    return float(np.isin(np.asarray(seg_array), ids).mean())
+
+
+def probe_body_coverage(camera_pos, look_at, resolution, probe_idx=0):
+    """Render ONE frame from a candidate viewpoint and return the fraction of
+    pixels covered by dynamic bodies (camera-framing-fix.md §5, Stage 2).
+
+    Creates and tears down its own seg-only render product so it leaves no
+    residue in the real capture rig. The caller is responsible for posing the
+    bodies (e.g. teleporting them to the max-spread snapshot) before calling.
+    """
+    cam = rep.create.camera(
+        position=tuple(camera_pos),
+        look_at=tuple(look_at),
+        focal_length=_CAM_FOCAL_MM,
+        horizontal_aperture=_CAM_HORIZ_APERTURE_MM,
+        clipping_range=(0.1, 100.0),
+        f_stop=0.0,
+        focus_distance=400.0,
+    )
+    rp = rep.create.render_product(cam, tuple(resolution), name=f"rp_probe_{probe_idx:04d}")
+    seg = rep.AnnotatorRegistry.get_annotator(
+        "semantic_segmentation", init_params={"colorize": False},
+    )
+    seg.attach(rp)
+    rep.orchestrator.step()  # render the probe frame
+    data = seg.get_data()
+    arr = data["data"] if isinstance(data, dict) else data
+    info = data["info"] if isinstance(data, dict) else None
+    cov = body_seg_coverage(arr, info)
+    seg.detach()
+    try:
+        rp.destroy()
+    except Exception:
+        pass  # best-effort cleanup; a stale probe RP is harmless if reset clears it
+    return cov
 
 
 def make_rig_annotators(rig, resolution):

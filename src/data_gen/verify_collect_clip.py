@@ -47,7 +47,6 @@ from omni.isaac.core.utils.stage import create_new_stage
 
 import lighting
 from clip_capture import (
-    ClipConfig,
     build_metadata,
     capture,
     log_state_frame,
@@ -57,6 +56,7 @@ from clip_capture import (
     save_clip,
     world_to_camera_frame,
 )
+from config import ClipConfig
 from seg_labels import apply_class_label
 
 

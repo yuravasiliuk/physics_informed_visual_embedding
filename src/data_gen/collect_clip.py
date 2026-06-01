@@ -64,20 +64,21 @@ import environments
 import lighting
 import scenarios
 from clip_capture import (
-    ClipConfig,
+    body_seg_coverage,
     build_metadata,
     capture,
     log_state_frame,
     make_rig_annotators,
+    probe_body_coverage,
     read_local_com,
+    rig_angle_centers,
     rotmat_to_quat_wxyz,
-    sample_camera_rig,
+    sample_camera_pose,
     save_clip,
     world_to_camera_frame,
 )
+from config import ClipConfig, DEFAULT_DATA_PATH
 
-
-DEFAULT_DATA_PATH = os.path.expanduser('~/data/sim_physics')
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -145,6 +146,11 @@ def build_scene(world: World, rng: np.random.Generator, config: ClipConfig, env_
                 prim_path="/World/ground_plane", z_position=0.0, color=ground_color,
             )
             ground_spec = {"color_rgb": [float(c) for c in ground_color]}
+    # Scale bodies up inside a loaded environment so they read at the env's
+    # scale instead of being a ~1% speck in a warehouse (Stage 3,
+    # camera-framing-fix.md). Procedural-ground scenes keep the base range.
+    if env_loaded:
+        config = dataclasses.replace(config, scale_range=config.scale_range_env)
     scenario_name = rng.choice(config.scenarios).item()
     bodies, body_specs, scene_specs, initial_velocities = scenarios.build(
         scenario_name, world, rng, config,
@@ -152,6 +158,91 @@ def build_scene(world: World, rng: np.random.Generator, config: ClipConfig, env_
     if ground_spec is not None:
         scene_specs["ground"] = ground_spec
     return bodies, body_specs, scene_specs, initial_velocities, scenario_name
+
+
+def _teleport_bodies(bodies, snapshot):
+    """Pose bodies at a pre-rolled (pos, quat) snapshot and zero their velocity.
+
+    Used to hold the bodies still at the probe pose: the probe's render step can
+    integrate physics by a frame, so re-posing before every probe keeps all
+    candidate cameras seeing the same configuration.
+    """
+    for body, (pos, quat) in zip(bodies, snapshot):
+        body.set_world_pose(np.asarray(pos, dtype=np.float64), np.asarray(quat, dtype=np.float64))
+        body.set_linear_velocity(np.zeros(3))
+        body.set_angular_velocity(np.zeros(3))
+
+
+def preroll_trajectory(world, bodies, initial_velocities, body_specs, config):
+    """Deterministic physics-only pre-roll (no rendering) to learn where the
+    bodies go, so the rig can frame + gate on the action (camera-framing-fix.md
+    §5, Stage 1).
+
+    Steps `config.frame_count` physics frames exactly as `simulate_clip` will,
+    recording each body's world pose. Returns:
+        centroid     : (3,) swept-AABB center of all body positions over time
+        cloud_radius : float — farthest body *surface* point from centroid
+        snapshot     : list of (pos, quat) at the frame whose body cloud is most
+                       spread out (the worst case for occlusion → probe pose)
+
+    The bodies are left wherever the pre-roll ends; the caller must re-pose or
+    rely on the `world.reset()` at the top of `simulate_clip` to rewind.
+    """
+    world.reset()
+    for body, (lin_vel, ang_vel) in zip(bodies, initial_velocities):
+        body.set_linear_velocity(np.asarray(lin_vel))
+        body.set_angular_velocity(np.asarray(ang_vel))
+
+    bound = np.array([
+        float(np.linalg.norm(body_factory.half_extents(s["shape"], s["dims"])))
+        for s in body_specs
+    ])
+    poses, quats = [], []
+    for _ in range(config.frame_count):
+        world.step(render=False)
+        frame_pos, frame_quat = [], []
+        for body in bodies:
+            p, q = body.get_world_pose()
+            frame_pos.append(np.asarray(p, dtype=np.float64))
+            frame_quat.append(np.asarray(q, dtype=np.float64))
+        poses.append(np.stack(frame_pos))
+        quats.append(np.stack(frame_quat))
+
+    P = np.stack(poses)   # (F, B, 3)
+    Q = np.stack(quats)   # (F, B, 4)
+    pts = P.reshape(-1, 3)
+    centroid = 0.5 * (pts.min(axis=0) + pts.max(axis=0))
+    dist = np.linalg.norm(P - centroid, axis=2) + bound[None, :]   # (F, B)
+    cloud_radius = float(dist.max())
+    spread = np.linalg.norm(P.max(axis=1) - P.min(axis=1), axis=1)  # (F,)
+    f_star = int(spread.argmax())
+    snapshot = list(zip(P[f_star], Q[f_star]))
+    return centroid, cloud_radius, snapshot
+
+
+def gate_camera_rig(bodies, rng, config, centroid, cloud_radius, snapshot):
+    """Propose an evenly-spaced rig anchored on the body cloud, then render-probe
+    each camera and resample/drop until it actually sees the bodies (Stage 2).
+
+    Bodies are teleported to the max-spread snapshot before every probe. Returns
+    the accepted list of (camera_pos_world, look_at_world) — length ≤ n_cameras
+    (a viewpoint that stays below `min_body_coverage` after
+    `camera_resample_attempts` is dropped; quality > count).
+    """
+    az0 = rng.uniform(0.0, 2.0 * np.pi)
+    centers = rig_angle_centers(config, az0)
+    rig = []
+    probe_idx = 0
+    for az_c, el_c in centers:
+        for _attempt in range(config.camera_resample_attempts + 1):
+            _teleport_bodies(bodies, snapshot)
+            pos, look = sample_camera_pose(rng, config, centroid, cloud_radius, az_c, el_c)
+            cov = probe_body_coverage(pos, look, config.resolution, probe_idx=probe_idx)
+            probe_idx += 1
+            if cov >= config.min_body_coverage:
+                rig.append((pos, look))
+                break
+    return rig
 
 
 def simulate_clip(world, bodies, initial_velocities, cam_annots, config, cam_extrinsics, collect_raw_pose=False):
@@ -232,9 +323,19 @@ def validate_clip(frames, state_records, config: ClipConfig):
             if not np.all(np.isfinite(arr)):
                 return False, f"nonfinite_state: frame={rec['frame']} body={rec['body']} key={key}"
 
-    for f_idx, f in enumerate(frames):
-        if int(np.asarray(f["seg"]).max()) == 0:
-            return False, f"empty_seg: frame={f_idx} has no foreground"
+    # Body visibility: the old `seg.max()==0` (any foreground) check is fooled by
+    # loaded environments — floor/walls are foreground, so a clip showing zero
+    # dynamic bodies still passed. Require the bodies to cover at least
+    # `min_body_coverage` of the frame at their peak (camera-framing-fix.md
+    # Stage 4). This is the write-time net behind the render-probe gating.
+    body_cov_peak = max(
+        (body_seg_coverage(f["seg"], f.get("seg_info")) for f in frames),
+        default=0.0,
+    )
+    if body_cov_peak < config.min_body_coverage:
+        return False, (
+            f"low_body_coverage: peak={body_cov_peak:.4f} < {config.min_body_coverage}"
+        )
 
     by_body: dict = {}
     for rec in state_records:
@@ -256,14 +357,16 @@ def validate_clip(frames, state_records, config: ClipConfig):
     return True, None
 
 
-def collect_clip(out_dirs, config: ClipConfig, seed: int, env_override: str = None):
-    """End-to-end collection of ONE physics rollout, fanned out to N clips.
+def collect_clip(base_out, start_idx, config: ClipConfig, seed: int, env_override: str = None):
+    """End-to-end collection of ONE physics rollout, fanned out to ≤N clips.
 
-    `out_dirs` is a list of `config.n_cameras` output directories — one per rig
-    camera. The physics rollout runs once; each camera's view is written to its
-    own directory as an INDEPENDENT clip (single-camera contract unchanged,
-    scene-diversification.md §10). Returns a list of `(ok, reason)` aligned with
-    `out_dirs`. `env_override` pins the environment choice.
+    The physics rollout runs once and is rendered from the cameras that survive
+    visibility gating (camera-framing-fix.md): each is written to its own
+    `base_out/clip_{start_idx+c:05d}` directory as an INDEPENDENT clip
+    (single-camera contract unchanged, scene-diversification.md §10). A rollout
+    may yield FEWER than `config.n_cameras` clips — or zero, if nothing is
+    viewable. Returns a list of `(out_dir, ok, reason)` for the clips written.
+    `env_override` pins the environment choice.
     """
     rng = np.random.default_rng(seed)
 
@@ -275,16 +378,23 @@ def collect_clip(out_dirs, config: ClipConfig, seed: int, env_override: str = No
     # Env first: a loaded backdrop ships its own floor + lights, which
     # suppresses both the procedural ground and the HDRI/fallback distant
     # light to avoid Z-fighting and double-bright scenes (plan §7 q3).
-    env_spec = environments.setup_random_environment(rng, force_name=env_override)
+    # When `config.use_isaac_envs` is False we hard-pin "none" so every clip
+    # runs the procedural ground + sky path (smoke_v0.3 clip_00008 showed
+    # office.usd silently rendering its floor textureless). An explicit
+    # `--environment` CLI override still wins.
+    effective_env_name = env_override
+    if effective_env_name is None and not config.use_isaac_envs:
+        effective_env_name = environments.NONE_NAME
+    env_spec = environments.setup_random_environment(rng, force_name=effective_env_name)
     if env_spec is None:
-        hdri_spec = lighting.setup_random_hdri(rng, config)
+        sky_spec = lighting.setup_random_sky(rng, config)
     else:
         # Env brings its own lights — but they reference HDRIs under
         # /NVIDIA/Assets/Skies/ that may not be in the local mirror. Install
         # a low-intensity distant light as a defensive floor so missing
         # textures don't render a black scene. Harmless overlay if the env's
         # authored lighting works.
-        hdri_spec = None
+        sky_spec = None
         lighting.install_fallback_distant_light(
             intensity=lighting.FALLBACK_LIGHT_INTENSITY_WITH_ENV,
         )
@@ -293,11 +403,21 @@ def collect_clip(out_dirs, config: ClipConfig, seed: int, env_override: str = No
     )
     if env_spec is not None:
         scene_specs["environment"] = env_spec
-    if hdri_spec is not None:
-        scene_specs["hdri"] = hdri_spec
-    # Camera rig: N jittered viewpoints on a shell around the scene (§10.2).
-    # Each becomes its own clip; the physics rollout is shared.
-    rig = sample_camera_rig(rng, config)
+    if sky_spec is not None:
+        scene_specs["sky"] = sky_spec
+    # Pre-roll the deterministic physics (no render) to learn where the bodies
+    # go, then frame + gate the rig on that cloud rather than the floor
+    # (camera-framing-fix.md §5, Stages 1–2). The body-cloud anchoring fixes the
+    # "looking at the floor / tiny speck" framing; the render-probe gate drops
+    # viewpoints occluded by env geometry or pointed at a wall/void.
+    centroid, cloud_radius, snapshot = preroll_trajectory(
+        world, bodies, initial_velocities, body_specs, config,
+    )
+    rig = gate_camera_rig(bodies, rng, config, centroid, cloud_radius, snapshot)
+    if not rig:
+        # Nothing viewable from any proposed viewpoint after resampling — emit no
+        # clips rather than save garbage (quality > count).
+        return []
     cam_annots = make_rig_annotators(rig, config.resolution)
     cam_extrinsics = []
     for cam_pos, look_at in rig:
@@ -317,12 +437,13 @@ def collect_clip(out_dirs, config: ClipConfig, seed: int, env_override: str = No
         spec["com_local_measured"] = read_local_com(body).tolist()
         spec["mass_measured"] = float(body.get_mass())
 
-    # Fan out: one independent clip per camera. body_specs is shared except the
-    # camera-frame initial-velocity projection (critique #2), which is recomputed
-    # per camera; the *_world fields are identical across siblings.
+    # Fan out: one independent clip per surviving camera. body_specs is shared
+    # except the camera-frame initial-velocity projection (critique #2), which is
+    # recomputed per camera; the *_world fields are identical across siblings.
     results = []
     C = len(rig)
     for c in range(C):
+        out_dir = os.path.join(base_out, f"clip_{start_idx + c:05d}")
         R_cw, cam_pos_w, _ = cam_extrinsics[c]
         specs_c = [dict(s) for s in body_specs]
         for spec, (lin_vel_world, ang_vel_world) in zip(specs_c, initial_velocities):
@@ -341,9 +462,9 @@ def collect_clip(out_dirs, config: ClipConfig, seed: int, env_override: str = No
             multiview={"rollout_seed": seed, "camera_index": c, "n_cameras": C},
         )
         meta["validation"] = {"ok": ok, "reason": reason}
-        save_clip(out_dirs[c], cam_frames[c], cam_records[c], meta,
+        save_clip(out_dir, cam_frames[c], cam_records[c], meta,
                   save_resolution=config.save_resolution)
-        results.append((ok, reason))
+        results.append((out_dir, ok, reason))
     return results
 
 
@@ -358,10 +479,9 @@ def main():
         config = dataclasses.replace(config, scenarios=(args.scenario,))
 
     base_out = os.path.abspath(args.result)
-    C = config.n_cameras
     n_ok = 0
     n_total = 0
-    global_idx = 0    # running clip index across all (rollout, camera) pairs
+    global_idx = 0    # running clip index across all surviving (rollout, camera) pairs
     for i in range(args.n_clips):
         # Isolate between rollouts: World is a singleton with cached physics
         # views, and the USD stage retains every prim from the prior rollout.
@@ -371,20 +491,21 @@ def main():
             World.clear_instance()
             create_new_stage()
 
-        # Each physics rollout fans out into C independent sibling clips
-        # (one per rig camera), written as flat clip_NNNNN dirs.
-        out_dirs = [os.path.join(base_out, f"clip_{global_idx + c:05d}") for c in range(C)]
+        # Each physics rollout fans out into the cameras that survive visibility
+        # gating (≤ n_cameras), written as flat clip_NNNNN dirs.
         seed = args.seed + i
-        results = collect_clip(out_dirs, config, seed, env_override=args.environment)
-        for c, (ok, reason) in enumerate(results):
+        results = collect_clip(base_out, global_idx, config, seed, env_override=args.environment)
+        for c, (out_dir, ok, reason) in enumerate(results):
             n_total += 1
             n_ok += int(ok)
             print(f"[rollout {i + 1}/{args.n_clips} cam {c}] "
-                  f"-> {os.path.basename(out_dirs[c])} seed={seed} ok={ok} reason={reason}")
-        global_idx += C
+                  f"-> {os.path.basename(out_dir)} seed={seed} ok={ok} reason={reason}")
+        if not results:
+            print(f"[rollout {i + 1}/{args.n_clips}] seed={seed} -> 0 clips (no viewable camera)")
+        global_idx += len(results)
 
     print(f"summary: {n_ok}/{n_total} clips validated "
-          f"({args.n_clips} rollouts x {C} cameras)")
+          f"from {args.n_clips} rollouts (≤{config.n_cameras} cameras each)")
     simulation_app.close()
 
 
