@@ -1,11 +1,12 @@
-"""Isaac Sim environment backdrops — warehouse / room USDs.
+"""Isaac Sim environment backdrops — warehouse / room / grid-room USDs.
 
 Tier 2 of `plans/isaac-asset-diversification.md`. Each clip samples one
-backdrop uniformly from (discovered envs + "none"). When a real env is
-picked, the USD brings its own authored floor and lights, so the caller
-skips the procedural `GroundPlane` and HDRI/fallback distant light to
-avoid Z-fighting on the floor and double-bright scenes. When "none" is
-picked, behavior matches the pre-Tier-2 pipeline exactly.
+backdrop uniformly from the discovered envs. Every env USD brings its own
+authored floor and lights, so the caller skips the procedural `GroundPlane`
+and HDRI/fallback distant light to avoid Z-fighting on the floor and
+double-bright scenes. The pre-Tier-2 procedural-ground path is no longer
+sampled at random (it rendered a textureless white void); it is reachable
+only via `setup_random_environment(force_name="none")` for debugging.
 
 Discovery follows the same pattern as `asset_library.py`: every candidate
 path is `omni.client.stat`-ed at import time, and any path missing on the
@@ -44,6 +45,15 @@ CANDIDATE_ENVIRONMENTS = [
     ("warehouse_with_forklifts", "/Isaac/Environments/Simple_Warehouse/warehouse_with_forklifts.usd"),
     ("warehouse_shelves",        "/Isaac/Environments/Simple_Warehouse/warehouse_multiple_shelves.usd"),
     ("simple_room",              "/Isaac/Environments/Simple_Room/simple_room.usd"),
+    # Grid rooms — the lightweight / bare-scene backdrop that REPLACES the old
+    # procedural "none" ground. That path rendered a textureless white floor
+    # blended into a white procedural dome (the clip_00000 void). Each grid
+    # room ships an authored floor + lights at z=0 and gives strong
+    # translation / parallax cues without warehouse clutter, so the encoder
+    # still sees sparse scenes — just not a featureless void.
+    ("grid_default",             "/Isaac/Environments/Grid/default_environment.usd"),
+    ("gridroom_black",           "/Isaac/Environments/Grid/gridroom_black.usd"),
+    ("gridroom_curved",          "/Isaac/Environments/Grid/gridroom_curved.usd"),
 ]
 
 ENV_PRIM_PATH = "/World/environment"
@@ -130,13 +140,13 @@ def setup_random_environment(rng, force_name: Optional[str] = None) -> Optional[
     if library.is_empty:
         return None
 
-    # Uniform over (discovered envs + "none") — "none" is one option among
-    # equals, giving the encoder a mix of richly-textured and bare scenes.
-    n_real = len(library.environments)
-    idx = int(rng.integers(0, n_real + 1))
-    if idx == n_real:
-        return None
-
+    # Uniform over discovered envs only — no "none" in the random draw. The
+    # bare-scene niche the procedural ground used to fill is now served by the
+    # Grid rooms (sparse, but with an authored floor + lights instead of the
+    # textureless white void of clip_00000). The procedural-ground + sky path
+    # survives solely for an explicit `force_name="none"` (debugging /
+    # `--environment none`); it is no longer sampled at random.
+    idx = int(rng.integers(0, len(library.environments)))
     name, url = library.environments[idx]
     add_reference_to_stage(usd_path=url, prim_path=ENV_PRIM_PATH)
     return {"name": name, "url": url}
