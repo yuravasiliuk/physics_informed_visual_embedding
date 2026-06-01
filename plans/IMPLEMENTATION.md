@@ -26,8 +26,10 @@ F config, sim-only physics heads, translated pairs, and ablations layer on top.
 
 **Phase 0 (single-clip data-gen pipeline) — code written, not yet validated end-to-end.**
 Next action: run `collect_clip.py` under the Isaac Sim Python env and confirm all
-outputs are sane (see P0.4). Nothing downstream is started, and **no model work is
-committed until the Phase-0.5 feasibility probe passes** (see the gate below).
+outputs are sane (see P0.4) — the validation procedure is in
+[data-gen-testing.md](data-gen-testing.md). Nothing downstream is started, and
+**no model work is committed until the Phase-0.5 feasibility probe passes** (see
+the gate below).
 
 ---
 
