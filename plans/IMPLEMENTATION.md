@@ -156,17 +156,23 @@ batch; one Isaac smoke cycle. Specs:
 
 ## P0.5 — Gating probes  ⛔ GATE A + GATE B
 
-*On Kubric MOVi-E / CLEVRER (shared GT ω/v/CoM, 4-frame RGB). Spec:
+*GATE A on Kubric MOVi-E / CLEVRER (shared GT ω/v/CoM, 4-frame RGB). GATE B
+implementation sub-plan: [probe/gate-b-probe.md](probe/gate-b-probe.md). Spec:
 [README §Baseline Step 3](../README.md#baseline-to-implement-this-milestone).*
 
 - ⬜ **(a) Feasibility probe** — small clip encoder + per-object dynamics heads.
   *Is dynamics learnable from perfect RGB at all?* → **GATE A**.
-- ⬜ **(b) Layer-wise frozen probe (Rung 0)** — linear probe of frozen V-JEPA 2 at
-  *each* intermediate block; compare DINO / SigLIP. *Is the signal in the frozen
-  encoder, at which depth?* → **GATE B**.
-- ⬜ **Decide before running:** reference upper-bound model (R9); state-readout vs.
-  future-prediction probe formulation (read-out preferred). See
-  [BRAINSTORM §7](BRAINSTORM.md#7-open-decisions).
+- ⬜ **(b) Layer-wise frozen probe (Rung 0)** — linear probe (arm 2a) + nonlinear
+  multi-layer head (arm 2b) of frozen V-JEPA 2 at *each* intermediate block;
+  compare DINO / SigLIP. *Is the signal in the frozen encoder, at which depth?* →
+  **GATE B**. **Decided with user:** frozen encoder only (no unfreeze), eval on a
+  held-out split of our own sim corpus, `v` as the harness control; IntPhys2 is a
+  later external-transfer iteration. Full design + kill criteria in
+  [probe/gate-b-probe.md](probe/gate-b-probe.md).
+- ⬜ **Decide before running:** V-JEPA 2 checkpoint → `save_resolution` lock (§14);
+  reference upper-bound model (R9); state-readout formulation (chosen). See
+  [probe/gate-b-probe.md §12](probe/gate-b-probe.md#12-open-decisions-settle-before-code)
+  and [BRAINSTORM §7](BRAINSTORM.md#7-open-decisions).
 
 ## P1 — Synthetic data at scale
 

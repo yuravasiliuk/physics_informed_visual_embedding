@@ -242,6 +242,23 @@ def sample_non_overlapping_positions(
     return positions
 
 
+def enable_ccd(prim):
+    """Enable PhysX continuous collision detection on a rigid body.
+
+    Discrete collision only tests at substep endpoints, so a body moving more
+    than ~its own half-extent per physics substep (the `collide` scenario's fast
+    closing speeds) can tunnel through its target and leave the pair
+    interpenetrating on the first rendered frame. CCD sweeps the shape along its
+    trajectory so the contact is caught. PhysX gates body CCD on scene CCD, which
+    collect_clip enables on the physics context.
+    """
+    if prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+        rb = PhysxSchema.PhysxRigidBodyAPI(prim)
+    else:
+        rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+    rb.CreateEnableCCDAttr().Set(True)
+
+
 def make_body(world, prim_path, name, shape, dims, position, color, orientation=None):
     """Spawn one dynamic primitive of the requested shape.
 
@@ -249,6 +266,7 @@ def make_body(world, prim_path, name, shape, dims, position, color, orientation=
     `Dynamic*` convention). Used by `topple` to spawn a body leaning just past
     its tip angle (physics-diversification.md W3a); None = axis-aligned.
     """
+
     if shape == "cuboid":
         return world.scene.add(DynamicCuboid(
             prim_path=prim_path, name=name, position=position, orientation=orientation,
@@ -395,6 +413,8 @@ def spawn_body(world, rng, config, i, shape, dims, position, color=None, orienta
     attach_density(prim, density)
     attach_center_of_mass(prim, com_local, prim_local_scale(prim))
     zero_damping(prim)
+    enable_ccd(prim)
+
     sf = float(rng.uniform(*config.static_friction_range))
     df = float(rng.uniform(*config.dynamic_friction_range))
     rest = float(rng.uniform(*config.restitution_range))
@@ -560,6 +580,8 @@ def spawn_composite_body(world, rng, config, i, dims, position, color=None, orie
     # wrapping — the proven asset_loader.load_dynamic_asset pattern.
     UsdPhysics.RigidBodyAPI.Apply(parent_prim)
     zero_damping(parent_prim)
+    enable_ccd(parent_prim)
+
 
     # One shared visual + physics material, bound to EACH child gprim. Binding on
     # the parent Xform does NOT propagate to the child Cubes for RTX rendering

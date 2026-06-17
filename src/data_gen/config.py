@@ -25,7 +25,7 @@ class ClipConfig:
     """Per-clip generation parameters. Defaults follow §7 of plans/data-gen/probe-dataset.md."""
 
     # Capture
-    frame_count: int = 32                     # K — plan §7
+    frame_count: int = 64                     # K — plan §7
     resolution: tuple = (1024, 1024)            # (width, height) — render/capture res, plan §7
     save_resolution: tuple = (1024, 1024)         # (width, height) saved rgb/depth/normals are
                                                 # downsampled to this; capture stays at `resolution`
@@ -227,6 +227,6 @@ TOPPLE_SHAPES = ("cuboid", "cylinder")       # only shapes with a flat base to s
 # Two bodies on a shared horizontal axis aimed at each other; momentum exchange
 # makes the mass ratio observable (mass decoupled from volume by W1).
 COLLIDE_HALF_SEP_RANGE = (0.30, 0.42)        # m, each body's distance from origin
-COLLIDE_SPEED_RANGE = (1.5, 30.0)            # m/s, horizontal closing speed per body
+COLLIDE_SPEED_RANGE = (1.5, 6.0)            # m/s, horizontal closing speed per body
 COLLIDE_HEIGHT_RANGE = (0.12, 0.22)          # m, shared spawn height of both centers
 COLLIDE_AIM_JITTER_DEG = 8.0                 # max ± aim jitter so it's not perfectly 1D

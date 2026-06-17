@@ -375,6 +375,7 @@ def collect_clip(base_out, start_idx, config: ClipConfig, seed: int, env_overrid
         physics_dt=config.physics_dt,
         rendering_dt=config.render_dt,
     )
+    world.get_physics_context().enable_ccd(True)
     # Env first: a loaded backdrop ships its own floor + lights, which
     # suppresses both the procedural ground and the HDRI/fallback distant
     # light to avoid Z-fighting and double-bright scenes (plan §7 q3).

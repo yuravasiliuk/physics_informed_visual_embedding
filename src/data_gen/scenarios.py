@@ -739,7 +739,7 @@ def build_collide(world, rng, config):
         )
         bodies.append(body)
         body_specs.append(spec)
-        speed = float(rng.uniform(*COLLIDE_SPEED_RANGE))
+        speed = float(rng.uniform(*_scaled(COLLIDE_SPEED_RANGE, s)))
         aim = float(rng.uniform(-jitter, jitter))
         lin_vel = speed * _rot_z(inward[i], aim)
         initial_velocities.append((lin_vel, _sample_angular_velocity(rng, config)))

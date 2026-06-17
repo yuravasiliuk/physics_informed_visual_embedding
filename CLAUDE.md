@@ -1,5 +1,10 @@
 # CLAUDE.md — operating manual for this repo
 
+### Principles
+1. Backward compatibility. The exisiting codebase should remain untouched unless user explicitly specified structural changes in functionality. Otherwise create new file. <br />
+2. Avoid code duplication. If there is possibility to import function prefer it over naive copy-paste. <br />
+
+
 Agent-facing working notes. **Not** an architecture doc — for *what* the project is
 and *why*, read [README.md](README.md) (the map) and the source-of-truth docs in
 [plans/](plans/). This file is only the *how to work here* layer.
