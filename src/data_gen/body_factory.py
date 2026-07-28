@@ -406,10 +406,23 @@ def spawn_body(world, rng, config, i, shape, dims, position, color=None, orienta
     density = float(rng.uniform(*config.density_range))
     volume = shape_volume(shape, dims)
     mass = density * volume
-    com_local = (
-        rng.uniform(-config.com_offset_frac, config.com_offset_frac, size=3)
-        * half_extents(shape, dims)
-    )
+    he = half_extents(shape, dims)
+    if config.com_offset_abs_range is None:
+        # Legacy (W2): offset = U(±frac)·half_extent — magnitude scales with body
+        # size, which makes |CoM| ∝ size (coverage audit: |CoM|~bbox +0.62 cache /
+        # +0.34 meta). Kept as default for backward-compatibility.
+        com_local = rng.uniform(-config.com_offset_frac, config.com_offset_frac,
+                                size=3) * he
+    else:
+        # Decorrelated (probe-corpus-spec.md): sample an ABSOLUTE offset magnitude
+        # in metres independent of size, in a random direction, then clamp per axis
+        # to com_offset_frac·half_extent so the CoM stays well inside the collision
+        # hull. Breaks |CoM|~size so a probe cannot decode CoM via silhouette (R8).
+        mag = float(rng.uniform(*config.com_offset_abs_range))
+        d = rng.normal(size=3)
+        d /= (np.linalg.norm(d) + 1e-12)
+        com_local = np.clip(mag * d, -config.com_offset_frac * he,
+                            config.com_offset_frac * he)
     attach_density(prim, density)
     attach_center_of_mass(prim, com_local, prim_local_scale(prim))
     zero_damping(prim)

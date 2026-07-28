@@ -43,6 +43,35 @@ against the `RuntimeError: could not place N bodies without overlap` class.
 
 ---
 
+## 0b. Dynamic-camera + contact rebuild — what to test, in order (2026-07-27)
+
+*The rebuild adds two things that can corrupt labels **silently**: per-frame
+extrinsics (every camera-frame label now depends on the frame-`t` camera, so one
+off-by-one silently rewrites the whole corpus) and PhysX contact events. Spec:
+[dynamic-camera.md](dynamic-camera.md).*
+
+**The governing rule: isolate the two motions before combining them.** With both
+the camera and the bodies moving you cannot tell which side a label error came
+from. So test in this order:
+
+| # | Test | Isaac? | What it isolates |
+|---|---|---|---|
+| 1 | `verify_camera_paths.py` (18 checks) + `verify_camera_motion.py [--all]` | no | trajectory math alone: legacy-basis equality, roll breaking `g.x≡0`, orbit/dolly = zero tilt, USD Euler round trip, SO(3) drift, command round trip, tracking-preserves-roll, determinism, clamps |
+| 2 | **Static bodies + MOVING camera** | yes | *pure logging/extrinsics*. Every logged `com_camera(t)` must equal the analytic reprojection of a FIXED world point through `R_cw(t)`. No physics involved → any error is wiring |
+| 3 | **Moving bodies + STATIC camera** | yes | the existing closed-form suite (ballistic, `spin_cuboid`, `two_body`) — must still pass **bit-identically**, proving the refactor didn't disturb the zero-coefficient path |
+| 4 | **Both moving** | yes | only now: egomotion identity — logged `v_cam`/`ω_cam` must match finite differences of the logged extrinsics; and `g_cam(t+1) == R_rel(t)·g_cam(t)` on LOGGED data (the offline version already passes, so a failure here is wiring, not math) |
+| 5 | **Contact impulse** — generate with `--log_contacts`, then `python3 src/data_gen/verify_contacts.py --data <corpus>` | gen only | `J_net ≈ m·Δv − m·g·Δt` per body per frame. **The trust gate for every contact label.** Residuals are split ground vs body-body because a flipped actor0/actor1 reaction fails body-body while ground still passes |
+| 6 | Smoke batch per camera family (§2 below) | yes | drop rate from path-aware visibility gating; framing survives the whole path |
+| 7 | `material_oracle --event_features` on the pilot | no | **acceptance**: restitution must reproduce ≈ +0.2 R² (event-anchored). A drop means the rebuild changed impact statistics |
+| 8 | Tilt non-degeneracy | no | `|g_cam.x|` spread > 0 **and** single-frame decodability ≪ full-clip (else it is still a horizon detector) |
+| 9 | Egomotion flow bound | no | egomotion-induced flow must not dominate object flow ([dynamic-camera.md §9.4](dynamic-camera.md)) |
+
+**Dead check to remove:** `offset_com` in `verify_physics_labels` tested the
+authored-CoM path, which is abandoned (EXPERIMENTS.md Graveyard). Deleting it is
+part of the CoM scrub, not a regression.
+
+---
+
 ## 1. Closed-form label-correctness checks (Isaac)
 
 These shoot known trajectories and compare the saved labels against analytic
@@ -69,7 +98,8 @@ ${ISAAC_SIM}/python.sh src/data_gen/verify_physics_labels.py --case offset_com
 ```
 
 `${ISAAC_SIM}` is your Isaac Sim install; the scripts pin the asset root to
-`file:///home/yura/isaac_assets` internally.
+`file://~/isaac_assets` internally (`collect_clip.ISAAC_ASSETS_DIR`, expanded at
+import — see the carb override at the top of that module).
 
 **What passing looks like.** `verify_physics_labels.py` prints one line per case
 and a final `summary: N/N cases passed` — you want **all** cases passed. Each run

@@ -3,7 +3,7 @@
 ### Principles
 1. Backward compatibility. The exisiting codebase should remain untouched unless user explicitly specified structural changes in functionality. Otherwise create new file. <br />
 2. Avoid code duplication. If there is possibility to import function prefer it over naive copy-paste. <br />
-
+3. When conducting training experiments always save train logs, tensorboard logs, TRAIN_RESULTS_AND_CONCLUSIONS.md and HOW_TO_TRAIN_AND_VERIFY.md
 
 Agent-facing working notes. **Not** an architecture doc — for *what* the project is
 and *why*, read [README.md](README.md) (the map) and the source-of-truth docs in
@@ -15,9 +15,12 @@ and *why*, read [README.md](README.md) (the map) and the source-of-truth docs in
   encoder/training/probes are planned, not written.
 - Docs are the source of truth, grouped under `plans/`: [theory/](plans/theory/)
   (modeling/paper), [data-gen/](plans/data-gen/) (collection pipeline),
-  [critique/](plans/critique/) (reviews). Two hubs stay at `plans/` root:
-  [BRAINSTORM.md](plans/BRAINSTORM.md) (architecture + risks R1–R11) and
-  [IMPLEMENTATION.md](plans/IMPLEMENTATION.md) (status / what's next / hard gates).
+  [critique/](plans/critique/) (reviews). Three hubs stay at `plans/` root, on
+  different axes: [BRAINSTORM.md](plans/BRAINSTORM.md) (**why** — architecture +
+  risks R1–R11), [IMPLEMENTATION.md](plans/IMPLEMENTATION.md) (**what's built** —
+  status / what's next / hard gates), and [EXPERIMENTS.md](plans/EXPERIMENTS.md)
+  (**what we're learning** — the hypothesis frontier; check it first for the
+  current active line and what's parked/killed).
 
 ## Source-of-truth rule
 When you change a load-bearing decision (anything under README §Best tactics or a
@@ -54,6 +57,12 @@ markers current as work lands.
   section** driving each choice — keep that density and the citations.
 - Commits go **directly to `main`** in this repo (no feature branch). End commit messages
   with the `Co-Authored-By: Claude Opus 4.8` trailer.
+- **Retire, don't delete.** Code whose question is settled moves to
+  [src/legacy/](src/legacy/) with a row in its README (why + what superseded it) —
+  never `rm`. Invariant: **nothing in `legacy/` may be imported by live code**;
+  if it is, it belongs elsewhere. Whole modules move; dead code *inside* a live
+  module gets a `DEPRECATED:` marker and goes on the next substantial edit.
+  Zero importers ≠ obsolete — check before moving.
 - **Don't spawn subagents** unless explicitly asked.
 - When moving/renaming docs, rewrite all relative links (README + hubs + cross-refs +
   `plans/...` strings in `.py` docstrings) and re-audit — links carry section anchors.

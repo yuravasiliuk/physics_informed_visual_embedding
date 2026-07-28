@@ -283,7 +283,8 @@ def collect_pair_rollout(base_out, start_idx, config: ClipConfig, seed: int,
             if label != "base":
                 meta["pair"]["kinematic_divergence"] = stats_by_label[label]
             save_clip(out_dir, cam_frames[c], cam_records[c], meta,
-                      save_resolution=config.save_resolution)
+                      save_resolution=config.save_resolution,
+                      depth_format=config.depth_format)
             results.append((out_dir, ok, reason))
     return results, stats_by_label
 

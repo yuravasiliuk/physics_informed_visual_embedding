@@ -18,6 +18,12 @@ import numpy as np
 import omni.replicator.core as rep
 
 from config import ClipConfig
+# Depth (de)serialization lives in its own Isaac-free module so codecs can be
+# A/B-tested offline. quantize_depth_uint16 is re-exported here (single source of
+# truth) so existing `from clip_capture import quantize_depth_uint16` keeps working.
+from depth_map_factory import DepthMapFactory, quantize_depth_uint16  # noqa: F401
+# Pure-numpy trajectory layer (no omni deps) — dynamic-camera.md §6.
+from camera_paths import egomotion_labels, look_at_basis, usd_rotation_xyz_deg
 
 # Camera intrinsics — the single source for both the live capture cameras
 # (make_annotators) and the framing-distance solver (framing_distance). Keep
@@ -66,7 +72,32 @@ def make_annotators(camera_position, look_at, resolution, rp_name=None):
     }
     for a in annots.values():
         a.attach(rp)
+    # Keep the camera handle so the dynamic-camera path can re-pose it every
+    # frame (dynamic-camera.md §6). `capture()` iterates known sensor keys, so
+    # this extra entry is inert for the static path.
+    annots["_camera"] = camera
     return annots
+
+
+def set_camera_pose(annots, camera_position, R_camera_world):
+    """Re-pose an existing rig camera for the current frame (dynamic camera).
+
+    Takes the ROTATION MATRIX, not a look-at, for two reasons:
+      * a look-at always rebuilds the zero-roll basis, which is precisely the
+        degeneracy the roll term exists to break; and
+      * a free 6-DoF path (camera_motion.FreeCameraPath) has an orientation that
+        is not expressible as "aim at a point" at all.
+    The Euler angles come from the SAME `R_camera_world` that gets logged, and
+    both verifiers gate the round trip — if the two ever disagree, the pixels and
+    the labels silently describe different cameras.
+
+    Call BEFORE `world.step(render=True)` for that frame, so frame t is rendered
+    from pose t.
+    """
+    with annots["_camera"]:
+        rep.modify.pose(position=tuple(float(x) for x in camera_position),
+                        rotation=usd_rotation_xyz_deg(R_camera_world))
+    return R_camera_world
 
 
 def framing_distance(cloud_radius, config):
@@ -207,31 +238,19 @@ def world_to_camera_frame(camera_pos, look_at, world_up=(0.0, 0.0, 1.0)):
     USD camera convention: +X right, +Y up, -Z forward (camera looks down -Z).
     R_camera_world rotates a *vector* expressed in world coords into camera coords.
     A *point* transforms as p_cam = R_camera_world @ (p_world - camera_pos_world).
+
+    Zero-roll legacy entry point, kept verbatim for backward compatibility. The
+    roll-capable superset is `camera_paths.look_at_basis(..., roll_rad=)`, and
+    `verify_camera_paths.py` gates that the two agree bit-wise at roll=0 — so the
+    static path is provably unchanged by the dynamic-camera work.
     """
-    camera_pos = np.asarray(camera_pos, dtype=np.float64)
-    look_at = np.asarray(look_at, dtype=np.float64)
-    world_up = np.asarray(world_up, dtype=np.float64)
-
-    forward = look_at - camera_pos
-    forward /= np.linalg.norm(forward)
-    # Degenerate-camera guard (critique #12). If forward is (near-)parallel to
-    # world_up, cross(forward, world_up) ~= 0 and the basis blows up to NaN. The
-    # camera rig clamps elevation below ~68° to stay clear of this, but guard
-    # explicitly so any future top-down scenario fails loudly, not silently.
-    right = np.cross(forward, world_up)
-    right_norm = np.linalg.norm(right)
-    if right_norm < 1e-6:
-        raise ValueError(
-            "Degenerate camera: forward is parallel to world_up "
-            f"(camera_pos={camera_pos.tolist()}, look_at={look_at.tolist()}). "
-            "Tilt the view off the vertical."
-        )
-    right /= right_norm
-    up = np.cross(right, forward)
-
-    R_world_camera = np.stack([right, up, -forward], axis=1)
-    R_camera_world = R_world_camera.T
-    return R_camera_world, camera_pos
+    # Delegates to the roll-capable implementation so there is ONE basis in the
+    # codebase (CLAUDE.md §Avoid code duplication). At roll_rad=0 it is the same
+    # arithmetic this function used to inline, and verify_camera_paths.py check
+    # #1 gates that equivalence against a verbatim copy of the old formula — so
+    # the static path is provably byte-for-byte unchanged. The degenerate-camera
+    # guard (critique #12) lives there now and raises the same ValueError.
+    return look_at_basis(camera_pos, look_at, roll_rad=0.0, world_up=world_up)
 
 
 def com_world_to_camera(com_world, R_camera_world, camera_pos_world):
@@ -347,8 +366,40 @@ def log_state_frame(bodies, local_coms, frame_idx, records, R_camera_world, came
         })
 
 
+def log_camera_frame(path, frame_idx, records, R_camera_world, camera_pos_world):
+    """Append the camera's own per-frame record (dynamic-camera.md §5.1).
+
+    "The camera is just another body": `lin_vel_camera` / `ang_vel_camera` use
+    the SAME names, units and frame convention as the per-body records — the
+    instantaneous camera frame — so existing target builders apply unchanged.
+
+    Absolute pose is deliberately NOT a training label (world origin and yaw
+    about gravity are gauge, unobservable from pixels). The extrinsics are
+    stored because they are the *transform*, from which any well-posed relative
+    target (window-anchored `R_rel`/`p_rel`, `g_camera`) is derived at
+    target-build time.
+
+    `path` is a CameraPath; for a static camera it is the zero-coefficient case
+    and the velocities come out exactly 0 (gated in verify_camera_paths.py).
+    """
+    v_cam, w_cam = egomotion_labels(path, frame_idx)
+    records.append({
+        "frame": frame_idx,
+        "R_camera_world": np.asarray(R_camera_world, dtype=np.float64).tolist(),
+        "camera_pos_world": [float(x) for x in camera_pos_world],
+        "q_camera_world": rotmat_to_quat_wxyz(R_camera_world).tolist(),
+        # gravity direction in camera frame — derived, but logged because every
+        # camera-frame physics judgement needs it and it is 3 floats.
+        "g_camera": (np.asarray(R_camera_world, dtype=np.float64)
+                     @ np.array([0.0, 0.0, -1.0])).tolist(),
+        "lin_vel_camera": [float(x) for x in v_cam],
+        "ang_vel_camera": [float(x) for x in w_cam],
+    })
+
+
 def build_metadata(config: ClipConfig, body_specs, scene_specs, scenario_name, R_camera_world, seed: int,
-                   camera_position_world=None, camera_look_at_world=None, multiview=None):
+                   camera_position_world=None, camera_look_at_world=None, multiview=None,
+                   camera_path=None):
     """Assemble one clip's meta.json.
 
     `camera_position_world` / `camera_look_at_world` override the config defaults
@@ -376,6 +427,16 @@ def build_metadata(config: ClipConfig, body_specs, scene_specs, scenario_name, R
     }
     if multiview is not None:
         meta["multiview"] = multiview
+    if camera_path is not None:
+        # Provenance + the schema bump that tells loaders the extrinsics are
+        # PER FRAME (camera.json), not the single meta-level matrix
+        # (dynamic-camera.md §5.1). meta["R_camera_world"] stays = frame 0 so
+        # static-camera consumers keep working unchanged.
+        meta["camera_path"] = camera_path.to_dict()
+        meta["camera_is_static"] = bool(camera_path.is_static())
+        if not camera_path.is_static():
+            meta["schema_version"] = "rigid-probe/v1-dyncam"
+            meta["extrinsics_per_frame"] = "camera.json"
     return meta
 
 
@@ -420,25 +481,6 @@ def _resize_seg(seg, size):
     return cv2.resize(seg, size, interpolation=cv2.INTER_NEAREST)
 
 
-def quantize_depth_uint16(depth_stack):
-    """Quantize a float depth stack to uint16 over its own finite [min, max].
-
-    Returns (q_uint16, d_min, d_max). Non-finite samples (sky / no-hit) are
-    pinned to d_max before quantizing. Invert with:
-        depth = d_min + q.astype(float32) / 65535 * (d_max - d_min)
-    """
-    finite = depth_stack[np.isfinite(depth_stack)]
-    d_min = float(finite.min()) if finite.size else 0.0
-    d_max = float(finite.max()) if finite.size else 1.0
-    span = d_max - d_min if d_max > d_min else 1.0
-    clipped = np.clip(
-        np.nan_to_num(depth_stack, nan=d_max, posinf=d_max, neginf=d_min),
-        d_min, d_max,
-    )
-    q = np.round((clipped - d_min) / span * 65535.0).astype(np.uint16)
-    return q, d_min, d_max
-
-
 def quantize_normals_uint8(normals_stack):
     """Map normals in [-1, 1] to uint8 via (n + 1) / 2 * 255 (fixed, rangeless).
 
@@ -447,15 +489,20 @@ def quantize_normals_uint8(normals_stack):
     return np.round((np.clip(normals_stack, -1.0, 1.0) + 1.0) * 0.5 * 255.0).astype(np.uint8)
 
 
-def save_clip(out_dir: str, frames, state_records, meta, save_resolution=(256, 256)):
+def save_clip(out_dir: str, frames, state_records, meta, save_resolution=(256, 256),
+              depth_format="npz", camera_records=None, contact_records=None):
     """Write the clip: rgb mp4 + quantized/compressed depth & normals + seg + JSON.
 
     All four sensor channels are downsampled to `save_resolution` (width,
     height) before saving. rgb/normals use INTER_AREA (continuous, antialiased);
     depth/seg use INTER_NEAREST (noise-free geometry / categorical IDs, so every
-    value stays physical and co-registered). depth -> uint16 (per-clip range, in
-    depth.npz), normals -> uint8 (fixed [-1,1] mapping, in normals.npz), seg ->
-    uint8 (or uint16 if >255 classes), in seg.npy.
+    value stays physical and co-registered). depth -> uint16 (per-clip range),
+    normals -> uint8 (fixed [-1,1] mapping, in normals.npz), seg -> uint8 (or
+    uint16 if >255 classes), in seg.npy.
+
+    `depth_format` selects the DepthMapFactory backend ("npz" default keeps the
+    legacy depth.npz schema; "ffv1"/"hevc12" store a video — see
+    depth_map_factory.py). Always writes a self-describing depth_meta.json sidecar.
     """
     os.makedirs(out_dir, exist_ok=True)
     size = (int(save_resolution[0]), int(save_resolution[1]))  # cv2 wants (width, height)
@@ -484,14 +531,12 @@ def save_clip(out_dir: str, frames, state_records, meta, save_resolution=(256, 2
         writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     writer.release()
 
-    depth_q, depth_min, depth_max = quantize_depth_uint16(depth_stack)
+    # Depth via the factory: quantize (uint16 per-clip range) + store via the
+    # chosen backend + write the depth_meta.json sidecar. "npz" reproduces the
+    # legacy depth.npz schema exactly; "ffv1"/"hevc12" store a video instead.
+    DepthMapFactory(backend=depth_format,
+                    fps=float(meta["render_fps"])).encode(out_dir, depth_stack)
     normals_q = quantize_normals_uint8(normals_stack)
-    np.savez_compressed(
-        os.path.join(out_dir, "depth.npz"),
-        depth=depth_q,
-        depth_min=np.float32(depth_min),
-        depth_max=np.float32(depth_max),
-    )
     np.savez_compressed(os.path.join(out_dir, "normals.npz"), normals=normals_q)
     np.savez_compressed(os.path.join(out_dir, "seg.npz"), seg=seg_stack)
 
@@ -502,6 +547,20 @@ def save_clip(out_dir: str, frames, state_records, meta, save_resolution=(256, 2
 
     with open(os.path.join(out_dir, "state.json"), "w") as f:
         json.dump(state_records, f, indent=2)
+
+    # Per-frame camera track (dynamic camera). Written whenever present — a
+    # static clip gets one too, with zero egomotion, so consumers have ONE code
+    # path instead of branching on camera kind (dynamic-camera.md §5.1).
+    if camera_records is not None:
+        with open(os.path.join(out_dir, "camera.json"), "w") as f:
+            json.dump(camera_records, f, indent=2)
+
+    # Contact events (contact_log.py) — the event TIMESTAMPS that make
+    # event-anchored targets constructible, plus solver-exact impulses that are
+    # immune to the render-rate sampling floor.
+    if contact_records is not None:
+        with open(os.path.join(out_dir, "contacts.json"), "w") as f:
+            json.dump(contact_records, f, indent=2)
 
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)

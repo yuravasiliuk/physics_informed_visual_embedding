@@ -3,3 +3,20 @@
 .kilo
 .claude
 *__pycache__
+
+# Build outputs / experiment artifacts — regenerable, don't track (IMPLEMENTATION.md §Tech debt)
+out/
+src/out/
+results/
+*.mkv
+*.npz
+src/result.png
+notebooks/
+results/
+reports/
+# Third-party paper PDFs — 35 MB+, redistribution of others' copyrighted files,
+# and git history keeps them forever. The summaries/ notes are what we actually
+# cite; keep the PDFs local.
+papers/
+scripts/viz_lora_topology.py
+papers/

@@ -4,7 +4,10 @@
 generation (P1) and before the feasibility/architecture gates lean on physics
 labels. Companion to [data_gen_critique0_analysis.md](../critique/data_gen_critique0_analysis.md)
 (#4, #7) and [observability-weighted-loss.md](../theory/observability-weighted-loss.md)
-(R6). Tracked operationally in [IMPLEMENTATION.md](../IMPLEMENTATION.md) P0 hardening.*
+(R6). Tracked operationally in [IMPLEMENTATION.md](../IMPLEMENTATION.md) P0 hardening.
+The W1/W2 decoupling decisions here are re-checked against the realized corpus in
+[scene-variability-rationale.md](scene-variability-rationale.md) (coverage audit —
+found a residual `CoM ⟂ size` confound of +0.62).*
 
 ## The confound this fixes
 
@@ -85,6 +88,16 @@ only; not yet run under Isaac.*
   body. W4 settles it; until then the `pos + R·com_local` reconstruction is
   unverified for the non-zero case.
 
+> **Update 2026-06-23 — `|CoM| ∝ size` confound found, optional abs-offset added.**
+> The fraction-of-extent scheme makes the offset magnitude scale with body size
+> (coverage audit: `|CoM|~size` +0.34 meta / +0.62 feature-cache). An additive,
+> default-`None` knob `ClipConfig.com_offset_abs_range` samples the primitive
+> offset as an *absolute* magnitude in metres instead (clamped inside the body) —
+> see [probe-corpus-spec.md](probe-corpus-spec.md) §3. It only partially decouples
+> (geometry bounds the offset for small bodies); the primary fix is probe-side
+> (decode normalized CoM / the existing size-controlled lift). Legacy behaviour is
+> unchanged when the knob is `None`.
+
 ### W3 — Observability scenarios ✅ DONE (topple fix in W3a)
 *Fixes the R6 no-signal-in-data half. New builders in `scenarios.py` + registry.*
 *Implemented: `build_topple` + `build_collide`, registered in `BUILDERS` and
@@ -93,7 +106,14 @@ only; not yet run under Isaac.*
 (shared with `build_random_bodies`, RNG order preserved). `topple`'s CoM-face
 signal is dormant until W2. Compile-checked only — not yet run under Isaac.*
 
-#### W3a — `topple` produces near-zero motion (energy-barrier bug) ⬜ TO IMPLEMENT
+#### W3a — `topple` produces near-zero motion (energy-barrier bug) ✅ IMPLEMENTED & FIELD-VERIFIED
+*Status update 2026-07-05: the lean+kick fix below IS implemented
+(`scenarios._topple_lean_pose`, `TOPPLE_LEAN_MARGIN_DEG`) and the v2 probe
+corpus was generated with it — topple bodies rotate 70–160° and finish falling
+by frame ~20–25/64. **But see W6**: guaranteeing motion this way OVERDETERMINES
+the outcome (the 3–8° past-critical lean toward a random azimuth decides the
+fall before the CoM offset can), which the com_oracle exposed — CoM is still
+not decodable even from GT trajectories on the v2 corpus.*
 *Found on inspection 2026-05-30: the `topple` scenario looks static.* The tip
 kick `TOPPLE_TIP_ANGVEL_RANGE = (1.0, 2.5)` rad/s is **at or below the tipping
 energy barrier**. For a typical tall body (footprint half ≈0.035 m, height half
@@ -263,3 +283,43 @@ reconstruction is correct. (Two *other* bugs surfaced instead — the unscaled
 - W5 ✅ done (was post-trust, parallel to early model work); W1–W5 complete.
 - Resolution (§14) and retry (#3) from the critique are independent and can land
   alongside, but are not blockers for *this* fidelity pass.
+
+## W6 — CoM-observability-first scenarios (`balance`, `eccentric_roll`) + the oracle gate
+
+*Added 2026-07-05, driven by the ★oracle result (`results/probe/com_oracle`,
+EXPERIMENTS.md): on the v2 corpus, CoM offset is not decodable **even from
+ground-truth trajectories** (lift ≈ 0, contact slices included). The R6 failure
+is not label quality or energy — it is scenario DESIGN: no scenario places
+bodies where the offset DECIDES a macroscopic outcome. W3a's topple guarantees
+motion by overdetermining it; drop/roll/push bury the offset in transients.*
+
+**Design principle (the separatrix rule):** a latent is observable only when
+the system sits near a decision boundary that the latent controls. Two new
+builders (in `scenarios.py`, registered; compile-checked, pending Isaac pilot):
+
+- **`balance`** — tall body spawned leaning in a narrow band **around** its
+  *geometric* critical angle (`BALANCE_LEAN_BAND_DEG = ±2.5°`), kick ≈ 0. The
+  authored offset (≤0.3·half-extent, W2/W5) shifts the *true* threshold by up
+  to ~±5° — wider than the band — so **tip vs. rock-back, direction, and
+  timing are decided by the invisible CoM**. Binary outcome = strongest
+  possible supervision signal. Logs `theta_crit_geom_deg` + `lean_deg` so the
+  geometric margin is recoverable per body.
+- **`eccentric_roll`** — offset-CoM cylinders (laid on their side) and spheres
+  rolling on flat ground at 0.8–2.0 m/s with a rolling-without-slipping start.
+  The offset modulates motion **continuously** (eccentric-wheel speed
+  oscillation; curved sphere paths) and the body settles CoM-low → the rest
+  orientation reads out the offset direction in body frame. Primitives only
+  (composites are cuboids); R8 holds (offset authored invisibly, one material).
+
+**The oracle acceptance gate (process change):** `src/probe/com_oracle.py` runs
+in PILOT mode from `meta.json`/`state.json` alone — no GPU, no feature extract.
+The loop for any new observability scenario is now:
+
+```
+design builder → ~20-rollout Isaac pilot → com_oracle (CPU, minutes)
+      → lift > 0 ? scale the scenario : redesign — never scale blind
+```
+
+This is the measurable form of R6: observability is *tested* before render
+spend. Only after a scenario passes the oracle does it earn a place in the
+probe corpus (and only then can an encoder CoM null be interpreted at all).

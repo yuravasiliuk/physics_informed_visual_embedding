@@ -15,6 +15,11 @@ off raw pixels so sim→real stability holds by construction. See §2.
 Risks are listed first deliberately — most of them are load-bearing and several
 can silently invalidate results.
 
+*This hub is the **why** (architecture + risks). Sibling hubs:
+[IMPLEMENTATION.md](IMPLEMENTATION.md) (**what's built**) and
+[EXPERIMENTS.md](EXPERIMENTS.md) (**what we're learning** — the active/parked/killed
+hypothesis frontier).*
+
 ---
 
 ## 0. Document map
@@ -34,6 +39,11 @@ at the [root README](../README.md) — this doc does not duplicate it.
   velocity); learned heteroscedastic σ.
 - [physics-latent-ladder.md](theory/physics-latent-ladder.md) — sibling "pragmatic
   ladder" brainstorm; pre-experiment staging of physics-latent-dynamics targets.
+- [world-lines.md](theory/world-lines.md) — allocentric, dimensionless world-line target
+  representation (Path-B geometric framing of the latent ladder: object/ego world-lines,
+  gravity-natural units, invariant⊕covariant factorization). Encoding layer + code in
+  [world-lines-encoding.md](theory/world-lines-encoding.md) (`src/worldlines/`, Phase E0
+  implemented + round-trip verified).
 
 **Critiques that feed the risks here:**
 - [data_gen_critique0.md](critique/data_gen_critique0.md) → its

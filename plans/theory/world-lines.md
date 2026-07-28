@@ -88,6 +88,47 @@ and (optionally) projected to the image with intrinsics `K`:
 `u_i(t) = π(K · p_i^C(t))`. The model predicts `p_i^W` and `T_WC`; `p_i^C` and `u_i`
 fall out by composition. This is what makes camera motion factor cleanly.
 
+### 2.4 Units: dimensionless, gravity-natural (decided)
+World-lines are **not** stored in meters-seconds. Monocular vision is metric only up to
+the **similarity group** (scale × rotation × translation), so the native representation is
+similarity-invariant, with metric as an *optional overlay* recovered from a
+recognized-object size prior. We fix the residual gauge with the one force that breaks
+scale-invariance — **gravity** — but only as far as gravity is *observable* (see direction
+vs. magnitude below). Time is always available (fps), normalized to clip duration
+(`τ ∈ [0,1]`).
+- Gravity breaks the similarity group's **scale** symmetry exactly as it breaks the
+  **rotational** symmetry to the yaw subgroup (`stab(g)_world`,
+  [theoretical-paper-plan.md §3](theoretical-paper-plan.md)). Same phenomenon, two axes.
+- **Direction vs. magnitude — they decouple, and this is the load-bearing distinction.**
+  Gravity *direction* (the up axis) is observable in nearly **any** scene (ground, normals,
+  resting/stacking) and fixes the **rotational** gauge. Gravity *magnitude* (the length
+  scale) needs observable **acceleration** — a fall, topple, bounce, or roll — and is
+  genuinely **absent in quasi-static scenes** (a resting object is in static equilibrium;
+  nothing accelerates, so it shows *which way* is down but **nothing about scale**).
+- **The length gauge is therefore tiered:**
+  1. gravitational-dynamics cue present → **gravity-natural unit** (`‖g‖ ≡ 1`), which *is*
+     metric-anchored (Earth `g`); lengths in "how far a body falls per clip."
+  2. else → a stable **scene-geometric unit** (median depth / ground-plane scale from the
+     depth map — does not depend on object count), **scale-free**, flagged
+     `scale_known=False`.
+  3. optional upgrade → metric via a **recognized-object size** prior (the human cue).
+- **Read inter-object relations *out* of the gauge; do not build the gauge *from* the
+  objects** (largest object / mean spacing rescales when an object is added/removed —
+  composition-dependent, poison for learning). Both `‖g‖` and median depth are
+  object-count-independent → stable.
+- **It costs nothing for our targets**, which are scale-free: `ω` (time metric),
+  restitution, CoM-offset/size (R7), mass **ratios** (vision never gives absolute mass —
+  only ratios via collision momentum exchange), trajectory classes (`J/m`, `c/m`). Absolute
+  metric scale is unknown in a no-cue scene, but those quantities have no real GT anyway
+  (R2). **The no-cue case is a real-footage concern, not a sim one:** our scenarios
+  (drop / stack-collapse / slope-roll / topple / domino) contain gravitational acceleration
+  by design (R6 observability), so tier 1 holds; only `cluttered-surface`/resting falls back
+  to tier 2.
+
+The encoder ([world-lines-encoding.md](world-lines-encoding.md)) keeps the metric
+world-frame arrays as ground truth and applies an **invertible** gauge transform, so the
+scheme is a tweakable, reversible step — not baked in.
+
 ### 2.3 Data already speaks this language
 The data-gen pipeline **logs state in world frame** and keeps `R_camera_world`
 recoverable (the "raw log stays world-frame; camera-frame conversion happens offline at
@@ -339,5 +380,30 @@ Only after §8 passes does any of this touch the Isaac corpus.
   [theoretical-paper-plan.md §3](theoretical-paper-plan.md) and the conservation framing of
   §5 (world-line derivatives ↔ momentum) in a concrete, differentiable head.
 - **Gated by GATE A** (§8) before any sim spend, exactly like the rest of the pipeline.
-</content>
-</invoke>
+
+---
+
+## 13. Implementation — encoding sim data → world-lines (Phase E0)
+
+Moved to its own file: **[world-lines-encoding.md](world-lines-encoding.md)** (data
+contract, `RawClip` interface, the encode pipeline, the round-trip verification, the
+synthetic generator, module layout, and what's tweakable). Code:
+[`src/worldlines/`](../../src/worldlines/) — implemented, round-trip verified.
+
+## 14. Camera & units at inference: what's recoverable (reference)
+Not geometrically camera-agnostic; the camera is *predicted from the image under a learned
+prior* (taught by intrinsics+pose DR in sim) and/or delegated to pretrained depth/normals
+(inheriting R3). Sorted by what scale a target needs:
+
+| Target | Needs metric length? | Recoverable, unknown real camera |
+|---|---|---|
+| ω (rad/s; time is metric from fps) | no | ✅ |
+| restitution, mass **ratios**, `J/m`, `c/m` | no (dimensionless) | ✅ |
+| CoM offset / object size (R7) | no (ratio) | ✅ |
+| absolute velocity / mass / length | yes | ❌ (up-to-scale only) |
+
+The survivable targets are exactly the dimensionless ones — and the ones that die are the
+absolute-metric quantities that have no real GT anyway (R2), so unknown-camera and
+unverifiability fail on the *same* set. One practical metric anchor: assuming Earth
+`g≈9.81` and a fall/ballistic segment in-frame, `½g·t²` converts metric time → length.
+No gravity cue → up-to-scale (§2.4, tier 2).

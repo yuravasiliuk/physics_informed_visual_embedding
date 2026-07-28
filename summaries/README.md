@@ -13,6 +13,7 @@ Working notes on the papers in [../papers](../papers), grouped by relevance to t
 
 ## Frozen-encoder candidates / world models
 - **[v-jepa2.md](v-jepa2.md)** — V-JEPA 2 video encoder + action-conditioned predictor. Strong candidate for the "frozen semantic encoder" branch; also shows zero-shot robot planning from RGB alone.
+- **[v-jepa2-1.md](v-jepa2-1.md)** — V-JEPA 2.1: diagnoses and fixes V-JEPA 2's weak *dense/local* features (context tokens were unsupervised, behaved like register tokens). Directly bears on the Rung-0 gating probe: a "no signal" result on vanilla V-JEPA 2 is now confounded with this fixable artifact. Ships a 300M distilled variant near 2B-teacher quality.
 - **[dreamer-v3.md](dreamer-v3.md)** — Latent world model + actor-critic; general-purpose RL across 150+ tasks. Reference point for "learn a world model in latent space."
 - **[cosmos-predict1.md](cosmos-predict1.md)** — NVIDIA Cosmos WFM platform (diffusion + autoregressive video world models, video tokenizers, post-training for camera/robot/driving).
 - **[cosmos-predict2.5.md](cosmos-predict2.5.md)** — Cosmos-Predict2.5 / Cosmos-Transfer2.5: flow-matching WFMs and a control-net Sim2Real / Real2Real translator. The Transfer2.5 idea (sim → photorealistic real) is a direct **alternative** to the brainstorm direction (real & sim → shared embedding).

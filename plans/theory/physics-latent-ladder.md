@@ -4,6 +4,8 @@
 
 **Brutal-honesty mandate:** this document is meant to be picked apart. Sections marked **[Honest take]** are deliberately critical and should be argued with, not nodded at.
 
+**Related:** the geometric instantiation of Path B (§8) — allocentric, dimensionless world-lines — is now its own design doc, [world-lines.md](world-lines.md) (encoding layer implemented in `src/worldlines/`).
+
 ---
 
 ## 1. Origin of the idea

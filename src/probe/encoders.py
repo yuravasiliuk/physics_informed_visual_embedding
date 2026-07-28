@@ -149,7 +149,7 @@ class VJEPA2Encoder:
                                              t_grid, s_grid)
             total = float(wv.sum())
             if total <= 0.0:
-                feats.append(torch.zeros(self.n_layers, hs.shape[2]))
+                feats.append(torch.zeros(self.n_layers, hs.shape[2], device=hs.device))
                 weights.append(0.0)
                 continue
             w = torch.from_numpy(wv).to(hs.device)

@@ -4,11 +4,12 @@ The only entry point of src/probe (gate-b-probe.md §7); never imports Isaac.
 Two stages, so the GPU pass happens once and fits stay re-runnable:
 
     # 1. encode the corpus → cached per-(clip, body) pooled features
-    python src/probe/run_probe.py extract --data ~/data/probe --out out/probe/feats.npz
+    python src/probe/run_probe.py extract --data ~/data/probe \
+        --result_path results/probe/feats.npz
 
     # 2. group-split, ridge per (layer, target), per-layer report
-    python src/probe/run_probe.py fit --features out/probe/feats.npz \
-        --report out/probe/2a_vjepa2.json
+    python src/probe/run_probe.py fit --features results/probe/feats.npz \
+        --report results/probe/2a_vjepa2.json
 
 The fit stage needs no GPU/torch — only numpy + the cache.
 
@@ -78,9 +79,9 @@ def cmd_extract(args):
 
     if not rows["X"]:
         sys.exit("no usable samples extracted")
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.result_path)), exist_ok=True)
     np.savez_compressed(
-        args.out,
+        args.result_path,
         X=np.stack(rows["X"]),
         weight=np.asarray(rows["weight"], dtype=np.float32),
         v=np.stack(rows["v"]).astype(np.float32),
@@ -96,7 +97,7 @@ def cmd_extract(args):
         variant=np.asarray(rows["variant"]),
         model=np.asarray(enc.model_id),
     )
-    print(f"wrote {len(rows['X'])} samples x {rows['X'][0].shape} -> {args.out} "
+    print(f"wrote {len(rows['X'])} samples x {rows['X'][0].shape} -> {args.result_path} "
           f"({skipped} clips had no usable bodies)")
 
 
@@ -229,7 +230,7 @@ def main():
 
     pe = sub.add_parser("extract", help="encode corpus -> features cache")
     pe.add_argument("--data", required=True, help="root of clip dirs")
-    pe.add_argument("--out", required=True, help="output .npz cache")
+    pe.add_argument("--result_path", required=True, help="output .npz cache")
     pe.add_argument("--vjepa_repo", default="~/vis_emb/vjepa2",
                     help="facebookresearch/vjepa2 checkout (its src/ is imported)")
     pe.add_argument("--weights", default=None,
