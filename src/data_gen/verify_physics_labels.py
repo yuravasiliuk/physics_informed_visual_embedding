@@ -18,16 +18,7 @@ below use only constant/relative/body-local quantities.
                       into the reconstructed body quat -> non-zero x,y); the
                       per-frame angular increment must equal omega*render_dt.
 
-  B. offset_com     — body built through the PRODUCTION path (body_factory.
-                      spawn_body, W2) with a scale-corrected offset CoM. The
-                      CoM-offset label is body-local and frame-free, so:
-                        * read_local_com (the physical CoM PhysX uses) must
-                          equal the authored offset — the scale-fix regression
-                          (pre-fix it was off by the 0.4x prim scale), and
-                        * the reconstructed world CoM has constant xy (guards
-                          against get_world_pose double-counting) and a z second
-                          difference of -g*render_dt^2 (constant gravity),
-                          validating the world<-camera reconstruction.
+  B. (removed 2026-07-28 with the CoM target — see the note where it lived.)
 
   C. two_body       — two bodies at well-separated start points; asserts the
                       per-body state records stay matched to the right body
@@ -39,10 +30,28 @@ below use only constant/relative/body-local quantities.
                       equal the analytic ΣρV / ΣρV·t form the label assumes —
                       the per-shape-density composition is the one uncertain
                       runtime behaviour. Same xy-constant / gravity trajectory
-                      sanity as offset_com.
+                      sanity the retired offset_com case carried.
 
   E. production_cam  — satisfied implicitly: every case above runs at the
                       production camera pose.
+
+  F. moving_camera  — ★ the DYNAMIC-camera gate (dynamic-camera.md §7). Every
+                      camera-frame label now depends on the frame-`t` camera, so
+                      a single off-by-one silently rewrites the whole corpus and
+                      still looks physically plausible. Asserts, per frame:
+                        * exact reprojection — world CoM reconstructed from
+                          `com_camera(t)` through `R_cw(t)` equals the
+                          camera-agnostic `get_world_pose` (collect_raw_pose),
+                          so this is independent of what the bodies did;
+                        * the same for orientation via quat composition;
+                        * a NEGATIVE CONTROL: redoing the reprojection with the
+                          frame-shifted extrinsics must be orders of magnitude
+                          worse, proving the check can actually see an
+                          off-by-one rather than passing vacuously;
+                        * on the logged camera records, `g_cam` unit-norm and
+                          the equivariance identity g(t+1) == R_rel(t)·g(t), and
+                          egomotion matching finite differences of the logged
+                          extrinsics.
 
 Out of scope (no clean closed form): general tumbling (Euler precession),
 PhysX CoM on real meshes, and the composite *inertia* tensor (PhysX-computed,
@@ -55,15 +64,22 @@ from isaacsim import SimulationApp
 
 simulation_app = SimulationApp({"headless": True, "renderer": "RaytracedLighting"})
 
+# `os` is imported out of alphabetical order on purpose: the carb override below
+# needs it and must run before the omni/isaac imports.
+import os
+
 import carb
+# Local Isaac asset root — same override collect_clip applies at import, kept
+# here because this module boots its own SimulationApp before importing it.
+# `~` is expanded rather than hardcoded so the path is not machine-specific.
+ISAAC_ASSETS_DIR = os.path.expanduser("~/isaac_assets")
 carb.settings.get_settings().set(
-    "/persistent/isaac/asset_root/default", "file:///home/yura/isaac_assets",
+    "/persistent/isaac/asset_root/default", f"file://{ISAAC_ASSETS_DIR}",
 )
 
 import argparse
 import dataclasses
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -78,10 +94,12 @@ import body_factory
 import lighting
 from collect_clip import simulate_clip
 from seg_labels import apply_class_label
+from camera_motion import sample_any_path
+from camera_rig import CameraRig
 from clip_capture import (
     build_metadata,
-    make_annotators,
     quat_wxyz_mul,
+    quat_wxyz_to_rotmat,
     read_local_com,
     rotmat_to_quat_wxyz,
     save_clip,
@@ -132,9 +150,27 @@ def _quat_conj(q):
 
 
 def _quat_angle_between(qa, qb):
-    """Geodesic angle (rad) between two wxyz unit quaternions (sign-agnostic)."""
-    d = abs(float(np.dot(qa, qb)))
-    return 2.0 * np.arccos(np.clip(d, 0.0, 1.0))
+    """Geodesic angle (rad) between two wxyz quaternions (sign-agnostic).
+
+    Normalizes first, then uses the atan2 half-angle form instead of
+    `2*arccos(|dot|)`. Both changes matter, and only the tight `moving_camera`
+    tolerance exposed why: Isaac's `get_world_pose` returns quaternions
+    normalized only to float32 (‖q‖ = 1 − ~2e-7), and arccos AMPLIFIES that
+    near zero — arccos(1−ε) ≈ √(2ε) turns a 2e-7 norm deficit into ~9e-4 rad of
+    phantom angle. `case_spin_cuboid` never noticed because its tolerance is
+    0.02 rad. atan2 is well-conditioned at small angles, so the residual becomes
+    the true float64 round-trip error (~1e-15).
+    """
+    qa = np.asarray(qa, dtype=np.float64)
+    qb = np.asarray(qb, dtype=np.float64)
+    qa = qa / max(float(np.linalg.norm(qa)), 1e-300)
+    qb = qb / max(float(np.linalg.norm(qb)), 1e-300)
+    if float(np.dot(qa, qb)) < 0.0:      # q and -q are the same rotation
+        qb = -qb
+    # dot = cos(θ/2)  =>  ‖qa−qb‖ = 2|sin(θ/4)|, ‖qa+qb‖ = 2|cos(θ/4)|,
+    # so the atan2 is θ/4 and the factor is FOUR, not two.
+    return 4.0 * float(np.arctan2(float(np.linalg.norm(qa - qb)),
+                                  float(np.linalg.norm(qa + qb))))
 
 
 def _frame_times(config):
@@ -158,11 +194,10 @@ def case_spin_cuboid(world, config, R_cw, cam_pos, q_cw, seed):
     apply_class_label(spin_prim, "spin_cuboid")
     body_factory.zero_damping(spin_prim)   # match production: no PhysX default damping
     init_v = [(np.zeros(3), np.array([0.0, 0.0, omega]))]
-    cam_frames, cam_recs = simulate_clip(
-        world, [cuboid], init_v, [_annots(config)],
-        config, [(R_cw, cam_pos, q_cw)],
+    rollout = simulate_clip(
+        world, [cuboid], init_v, _rig(config), config,
     )
-    frames, recs = cam_frames[0], cam_recs[0]
+    frames, recs = rollout.frames[0], rollout.state_records[0]
 
     # Torque-free (constant omega about +Z) only while airborne; a cube spinning
     # about +Z keeps its bottom face flat, so the lowest point stays at
@@ -205,74 +240,15 @@ def case_spin_cuboid(world, config, R_cw, cam_pos, q_cw, seed):
     }
 
 
-# --- case B: authored offset CoM (production path) --------------------------
-
-def case_offset_com(world, config, R_cw, cam_pos, q_cw, seed):
-    rng = np.random.default_rng(seed)
-    omega = 3.0
-    side = 0.4                                   # scale=0.4 -> the scale bug, if
-                                                 # unfixed, shrinks the offset 0.4x
-    start = np.array([0.0, 0.0, 1.2])            # prim-origin spawn, unrotated
-    # Production path: spawn_body authors the scale-corrected offset CoM (W2).
-    body, spec = body_factory.spawn_body(
-        world, rng, config, 0, "cuboid", (side, side, side), start,
-    )
-    com_authored = np.array(spec["com_local_authored"], dtype=np.float64)
-
-    init_v = [(np.zeros(3), np.array([0.0, 0.0, omega]))]
-    cam_frames, cam_recs = simulate_clip(
-        world, [body], init_v, [_annots(config)],
-        config, [(R_cw, cam_pos, q_cw)],
-    )
-    frames, recs = cam_frames[0], cam_recs[0]
-
-    air = _airborne_mask(config, bottom_height_m=start[2] - side / 2.0)
-    idx = np.where(air)[0]
-
-    # (1) THE label check (body-local, frame-free): the physical CoM PhysX uses
-    # (read_local_com) must equal the authored offset. This is the scale-fix
-    # regression test — pre-fix it was off by the 0.4x prim scale.
-    com_measured = read_local_com(body)
-    com_label_err = float(np.linalg.norm(com_measured - com_authored))
-
-    # (2) Trajectory-reconstruction sanity (warmup-independent), to confirm the
-    # world<-camera CoM path is sound and get_world_pose isn't double-counting:
-    com_world = np.stack([
-        _world_from_cam_point(r["com_camera"], R_cw, cam_pos)
-        for r in _records_for(recs, body.name)
-    ])
-    # (2a) CoM has no horizontal force, so its xy is constant. If get_world_pose
-    # returned the CoM (double-count), the reconstruction would wobble by the
-    # spinning R*com_local -> xy std would blow up. Flat xy == correct.
-    xy_std = float(np.linalg.norm(com_world[idx, :2].std(axis=0)))
-    # (2b) Constant gravity: the discrete second difference of z equals
-    # -g*render_dt^2 exactly for symplectic Euler (independent of any warmup).
-    dt = config.render_dt
-    zz = com_world[idx, 2]
-    if len(zz) >= 3:
-        second_diff = zz[2:] - 2.0 * zz[1:-1] + zz[:-2]
-        accel_err = float(np.max(np.abs(second_diff - (-GRAVITY * dt * dt))))
-    else:
-        accel_err = float("inf")
-
-    passed = (len(idx) >= 4
-              and com_label_err < COM_READBACK_TOL_M
-              and xy_std < 5e-3
-              and accel_err < 0.05 * GRAVITY * dt * dt)
-    return frames, recs, {
-        "case": "offset_com",
-        "airborne_frames": int(len(idx)),
-        "com_local_authored": com_authored.tolist(),
-        "com_local_measured": com_measured.tolist(),
-        "com_label_err_m": com_label_err,
-        "traj_xy_std_m": xy_std,
-        "traj_accel_err": accel_err,
-        "passed": bool(passed),
-        "note": ("com_label_err_m is the scale-fix regression: measured CoM "
-                 "must equal the authored offset. traj_xy_std_m guards against "
-                 "get_world_pose double-counting; traj_accel_err checks the "
-                 "world<-camera reconstruction tracks constant gravity."),
-    }
+# --- case B: REMOVED 2026-07-28 ---------------------------------------------
+# `case_offset_com` verified that a primitive's PhysX CoM equalled the offset
+# authored by `body_factory.attach_center_of_mass` (the W2/W4 scale-fix
+# regression). That authoring was removed with the CoM target, so the case had
+# nothing left to assert — a uniform primitive's CoM is now the prim origin by
+# construction. The two guarantees it *also* carried are not lost: the
+# get_world_pose-double-count guard and the world<-camera reconstruction check
+# both live on in `case_composite` (whose CoM offset is real and closed-form)
+# and, per frame under a MOVING camera, in `case_moving_camera` below.
 
 
 # --- case D: composite glued body (W5) --------------------------------------
@@ -311,11 +287,10 @@ def case_composite(world, config, R_cw, cam_pos, q_cw, seed):
     ) / mass_analytic
 
     init_v = [(np.zeros(3), np.array([0.0, 0.0, omega]))]
-    cam_frames, cam_recs = simulate_clip(
-        world, [body], init_v, [_annots(config)],
-        config, [(R_cw, cam_pos, q_cw)],
+    rollout = simulate_clip(
+        world, [body], init_v, _rig(config), config,
     )
-    frames, recs = cam_frames[0], cam_recs[0]
+    frames, recs = rollout.frames[0], rollout.state_records[0]
 
     # (1) THE label checks: PhysX-integrated mass / CoM == the analytic ΣρV form.
     mass_measured = float(body.get_mass())
@@ -369,6 +344,119 @@ def case_composite(world, config, R_cw, cam_pos, q_cw, seed):
     }
 
 
+# --- case F: moving camera — per-frame extrinsics ---------------------------
+
+def case_moving_camera(world, config, R_cw, cam_pos, q_cw, seed):
+    """★ Per-frame extrinsics gate (dynamic-camera.md §7).
+
+    Isolation, deliberately: the check compares the logged camera-frame labels
+    against `get_world_pose` — the camera-AGNOSTIC world pose — so it is exact
+    whether the bodies are moving or still, and any residual is a camera/logging
+    fault with no physics component to argue about. That is what test-ladder
+    step 2 ("static bodies + moving camera") is really asking, without needing
+    the bodies to actually hold still.
+
+    The path is `handheld` with `roll_always`: translation AND rotation AND roll
+    together. A pure-translation path would leave `R_cw` constant and the whole
+    per-frame question untested.
+    """
+    rng = np.random.default_rng(seed)
+    path = sample_any_path(
+        rng, "subject:handheld", config.camera_position, config.camera_look_at,
+        config.frame_count, config.render_dt,
+        el_clamp_deg=config.camera_elevation_clamp_deg,
+        d_clamp=config.camera_radius_clamp, roll_always=True,
+    )
+    bodies = []
+    for i, p in enumerate((np.array([-0.25, 0.0, 0.75]), np.array([0.3, 0.1, 0.95]))):
+        b, _ = body_factory.spawn_body(world, rng, config, i, "cuboid", (0.12, 0.1, 0.16), p)
+        bodies.append(b)
+    init_v = [(np.zeros(3), np.array([0.0, 0.0, 2.5])) for _ in bodies]
+
+    # collect_raw_pose gives the camera-agnostic ground truth; it takes priority
+    # over the cam_track return, so the camera records are rebuilt below through
+    # the SAME `log_camera_frame` production uses.
+    rollout = simulate_clip(
+        world, bodies, init_v, CameraRig.from_paths([path], config), config,
+        collect_raw_pose=True,
+    )
+    frames, recs = rollout.frames[0], rollout.state_records[0]
+    raw_pose, raw_quat = rollout.raw_pose_world, rollout.raw_quat_world
+    local_coms = [read_local_com(b) for b in bodies]
+
+    # (1) EXACT reprojection, per frame, per body.
+    pos_err = quat_err = 0.0
+    shifted_err = 0.0          # negative control, see below
+    T = config.frame_count
+    for b_i, body in enumerate(bodies):
+        brecs = _records_for(recs, body.name)
+        for t in range(T):
+            R_t, p_t = path.extrinsics(t)
+            R_body = quat_wxyz_to_rotmat(np.asarray(raw_quat[b_i][t]))
+            com_w_true = np.asarray(raw_pose[b_i][t]) + R_body @ local_coms[b_i]
+            com_w_got = _world_from_cam_point(brecs[t]["com_camera"], R_t, p_t)
+            pos_err = max(pos_err, float(np.linalg.norm(com_w_got - com_w_true)))
+
+            q_got = quat_wxyz_mul(_quat_conj(rotmat_to_quat_wxyz(R_t)),
+                                  np.asarray(brecs[t]["quat_camera_wxyz"]))
+            quat_err = max(quat_err, _quat_angle_between(
+                q_got, np.asarray(raw_quat[b_i][t])))
+
+            # NEGATIVE CONTROL: the same reprojection with the NEXT frame's
+            # extrinsics. If this is not far worse, the camera barely moved
+            # between frames and (1) is passing vacuously — the failure mode
+            # that would let a genuine off-by-one through unnoticed.
+            if t + 1 < T:
+                R_s, p_s = path.extrinsics(t + 1)
+                shifted_err = max(shifted_err, float(np.linalg.norm(
+                    _world_from_cam_point(brecs[t]["com_camera"], R_s, p_s) - com_w_true)))
+
+    # (2) The camera records THE PRODUCTION LOOP WROTE — not a re-derivation.
+    # Before RolloutResult these were unreachable here (collect_raw_pose took
+    # priority over the cam_track return and silently dropped them), so this
+    # check had to rebuild them by calling log_camera_frame itself — which
+    # tested the logger but not the wiring that feeds it. Now it tests both.
+    cam_track = rollout.camera_records[0]
+    assert len(cam_track) == T, f"camera_records has {len(cam_track)} of {T} frames"
+    g = np.array([r["g_camera"] for r in cam_track])
+    g_norm_err = float(np.abs(np.linalg.norm(g, axis=1) - 1.0).max())
+    equiv_err = 0.0
+    ego_err = 0.0
+    for t in range(T - 1):
+        R0, p0 = path.extrinsics(t)
+        R1, p1 = path.extrinsics(t + 1)
+        equiv_err = max(equiv_err, float(np.abs((R1 @ R0.T) @ g[t] - g[t + 1]).max()))
+        v_fd = R0 @ ((p1 - p0) / config.render_dt)
+        ego_err = max(ego_err, float(np.abs(
+            np.asarray(cam_track[t]["lin_vel_camera"]) - v_fd).max()))
+    tilt_span = float(np.abs(g[:, 0]).max())
+
+    passed = (pos_err < 1e-6 and quat_err < 1e-6
+              and shifted_err > 100.0 * max(pos_err, 1e-9)
+              and g_norm_err < 1e-9 and equiv_err < 1e-9 and ego_err < 1e-9
+              and tilt_span > 1e-3)
+    return frames, recs, {
+        "case": "moving_camera",
+        "camera_family": path.kind,
+        "frames": T,
+        "reproj_pos_max_err_m": pos_err,
+        "reproj_quat_max_err_rad": quat_err,
+        "frame_shifted_control_err_m": shifted_err,
+        "g_camera_norm_err": g_norm_err,
+        "g_camera_equivariance_err": equiv_err,
+        "egomotion_vs_finite_diff_err": ego_err,
+        "tilt_abs_gx_max": tilt_span,
+        "passed": bool(passed),
+        "note": ("reproj_* must be ~0: the camera-frame labels are compared "
+                 "against get_world_pose, which no camera touches. "
+                 "frame_shifted_control_err_m is the SAME reprojection done with "
+                 "frame t+1's extrinsics and must be far larger — otherwise the "
+                 "camera hardly moved and the test proves nothing. "
+                 "tilt_abs_gx_max > 0 confirms roll is present, without which "
+                 "g_cam.x is identically 0 and the tilt label is degenerate."),
+    }, cam_track
+
+
 # --- case C: two-body index alignment ---------------------------------------
 
 def case_two_body(world, config, R_cw, cam_pos, q_cw, seed):
@@ -381,11 +469,10 @@ def case_two_body(world, config, R_cw, cam_pos, q_cw, seed):
         )
         bodies.append(b)
     init_v = [(np.zeros(3), np.zeros(3)) for _ in bodies]
-    cam_frames, cam_recs = simulate_clip(
-        world, bodies, init_v, [_annots(config)],
-        config, [(R_cw, cam_pos, q_cw)],
+    rollout = simulate_clip(
+        world, bodies, init_v, _rig(config), config,
     )
-    frames, recs = cam_frames[0], cam_recs[0]
+    frames, recs = rollout.frames[0], rollout.state_records[0]
 
     # First logged frame: each body's com_world must sit near its own spawn xy,
     # not the other's. A swap shows up as the wrong start point.
@@ -405,15 +492,16 @@ def case_two_body(world, config, R_cw, cam_pos, q_cw, seed):
 
 # --- small helpers ----------------------------------------------------------
 
-def _annots(config):
-    return make_annotators(config.camera_position, config.camera_look_at, config.resolution)
+def _rig(config):
+    """The production static camera, as a one-camera rig (no gating)."""
+    return CameraRig.fixed(config.camera_position, config.camera_look_at, config)
 
 
 # --- driver -----------------------------------------------------------------
 
 CASES = {
     "spin_cuboid": case_spin_cuboid,
-    "offset_com": case_offset_com,
+    "moving_camera": case_moving_camera,
     "two_body": case_two_body,
     "composite": case_composite,
 }
@@ -440,13 +528,18 @@ def run_case(name, base_out, config, seed):
     R_cw, cam_pos = world_to_camera_frame(config.camera_position, config.camera_look_at)
     q_cw = rotmat_to_quat_wxyz(R_cw)
 
-    frames, recs, result = CASES[name](world, config, R_cw, cam_pos, q_cw, seed)
+    out = CASES[name](world, config, R_cw, cam_pos, q_cw, seed)
+    # A case may return a 4th element: the per-frame camera records for a moving
+    # camera. Length-checked so the three static cases stay untouched.
+    frames, recs, result = out[0], out[1], out[2]
+    camera_records = out[3] if len(out) > 3 else None
 
     out_dir = str(Path(base_out) / name)
     meta = build_metadata(config, [], {"static_assets": [], "scenario_specs": {}},
                           f"verify_{name}", R_cw, seed)
     meta["verify"] = result
-    save_clip(out_dir, frames, recs, meta, save_resolution=config.save_resolution)
+    save_clip(out_dir, frames, recs, meta, save_resolution=config.save_resolution,
+              camera_records=camera_records)
     with open(os.path.join(out_dir, "verify.json"), "w") as f:
         json.dump(result, f, indent=2)
     return result

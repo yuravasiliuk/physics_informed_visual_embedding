@@ -19,10 +19,13 @@ import numpy as np
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from camera_motion import (  # noqa: E402
-    MOTION_FAMILIES, FreeCameraPath, MotionModel, sample_free_path,
-    sample_motion, pan_tilt_roll, surge_sway_heave,
+    MOTION_FAMILIES, FreeCameraPath, MotionModel, resolve_family, sample_any_path,
+    sample_free_path, sample_motion, pan_tilt_roll, surge_sway_heave,
 )
-from camera_paths import look_at_basis, usd_rotation_xyz_deg, euler_xyz_deg_to_rotmat  # noqa: E402
+from camera_paths import (  # noqa: E402
+    egomotion_labels, euler_xyz_deg_to_rotmat, look_at_basis, sample_camera_path,
+    usd_rotation_xyz_deg,
+)
 
 DT = 1.0 / 30.0
 T = 64
@@ -160,6 +163,151 @@ def main():
     check("same seed -> identical path",
           all(np.allclose(a.extrinsics(t)[1], b.extrinsics(t)[1])
               and np.allclose(a.extrinsics(t)[0], b.extrinsics(t)[0]) for t in range(T)))
+
+    # --- last-frame egomotion ----------------------------------------------
+    #  FreeCameraPath caches a FIXED number of poses, so an index clamp at
+    #  n_frames-1 would make the final frame difference against itself and log
+    #  v = w = 0 — a corrupted label on 1/T of every dynamic clip, and one that
+    #  looks like plausible data rather than a crash. The extra integration step
+    #  in __init__ is what this asserts.
+    v_last, w_last = egomotion_labels(p_dolly, T - 1)
+    v_mid, _ = egomotion_labels(p_dolly, T // 2)
+    check("★ last-frame egomotion is real, not a clamped zero",
+          np.linalg.norm(v_last) > 0.5 * np.linalg.norm(v_mid),
+          f"|v[T-1]|={np.linalg.norm(v_last):.4f} vs |v[T/2]|={np.linalg.norm(v_mid):.4f}")
+
+    # --- speed_scale: ClipConfig.camera_speed_scale as a TIME WARP -----------
+    #  Defined as "the same shot traversed s times faster", i.e. x(s*t) — NOT a
+    #  gain on the velocity. The distinction is testable and these checks are
+    #  what make it more than a claim in a docstring: a pure output gain would
+    #  pass the travel-doubling check below and FAIL the warp identity, because
+    #  it stretches oscillation amplitudes instead of replaying them faster.
+    for name in ("free:dolly_in", "subject:orbit", "subject:handheld"):
+        base = sample_any_path(np.random.default_rng(5), name, POS0, LOOK0, T, DT,
+                               roll_always=True)
+        same = sample_any_path(np.random.default_rng(5), name, POS0, LOOK0, T, DT,
+                               roll_always=True, speed_scale=1.0)
+        d = max(np.abs(np.asarray(base.extrinsics(t)[1])
+                       - np.asarray(same.extrinsics(t)[1])).max() for t in range(T))
+        check(f"speed_scale=1.0 is bit-identical to the default [{name}]", d == 0.0,
+              f"max|dpos|={d:.1e}")
+
+    #  Warp identity. EXACT for the subject-anchored model (closed form in t);
+    #  first-order in dt for the free model, which integrates. The motion object
+    #  is shared deliberately: `sample_motion` takes n_frames and `_dolly_in`
+    #  scales its ramp by it, so re-sampling at a different n_frames would
+    #  compare two different shots and the residual would not converge.
+    m_warp = sample_motion(np.random.default_rng(5), "dolly_in", DT, T)
+    import dataclasses as _dc
+    errs = []
+    for dt_scale in (1, 2, 4):
+        dt_i, k_i = DT / dt_scale, T * dt_scale
+        p1 = FreeCameraPath(_dc.replace(m_warp, dt=dt_i, speed_scale=1.0), POS0, R0, 2 * k_i)
+        p2 = FreeCameraPath(_dc.replace(m_warp, dt=dt_i, speed_scale=2.0), POS0, R0, k_i)
+        errs.append(max(np.abs(p2.extrinsics(t)[1] - p1.extrinsics(2 * t)[1]).max()
+                        for t in range(k_i)))
+    check("★ free: pose(t)@s=2 == pose(2t)@s=1, first-order in dt",
+          errs[0] < 1e-2 and errs[1] < 0.6 * errs[0] and errs[2] < 0.6 * errs[1],
+          f"err {errs[0]:.2e} -> {errs[1]:.2e} -> {errs[2]:.2e} as dt halves")
+
+    for name in ("subject:orbit", "subject:handheld", "subject:arc", "subject:roll"):
+        p1 = sample_any_path(np.random.default_rng(5), name, POS0, LOOK0, 2 * T, DT,
+                             roll_always=True, speed_scale=1.0)
+        p2 = sample_any_path(np.random.default_rng(5), name, POS0, LOOK0, 2 * T, DT,
+                             roll_always=True, speed_scale=2.0)
+        e = max(np.abs(p2.extrinsics(t)[1] - p1.extrinsics(2 * t)[1]).max() for t in range(T))
+        check(f"★ subject: warp is EXACT (closed form) [{name}]", e < 1e-12,
+              f"max|dpos|={e:.1e}")
+
+    #  ...and it must actually double the egomotion label, or the knob is inert.
+    slow = sample_any_path(np.random.default_rng(5), "free:dolly_in", POS0, LOOK0, T, DT)
+    fast = sample_any_path(np.random.default_rng(5), "free:dolly_in", POS0, LOOK0, T, DT,
+                           speed_scale=2.0)
+    r = (np.mean([np.linalg.norm(egomotion_labels(fast, t)[0]) for t in range(T - 1)])
+         / max(np.mean([np.linalg.norm(egomotion_labels(slow, t)[0]) for t in range(T - 1)]), 1e-12))
+    check("speed_scale=2 doubles the logged |v_cam|", 1.9 < r < 2.2, f"ratio={r:.3f}")
+
+    #  s=0 must report STATIC, not "dynamic but stationary" — a dynamic rig pays
+    #  the along-path gate and per-frame prim re-posing for nothing.
+    z_free = sample_any_path(np.random.default_rng(5), "free:dolly_in", POS0, LOOK0, T, DT,
+                             speed_scale=0.0)
+    z_sub = sample_any_path(np.random.default_rng(5), "subject:orbit", POS0, LOOK0, T, DT,
+                            speed_scale=0.0)
+    check("speed_scale=0 reports is_static() in both models",
+          z_free.is_static() and z_sub.is_static())
+    check("speed_scale=0 really does freeze the pose",
+          all(np.allclose(z_free.extrinsics(t)[1], POS0) for t in range(T))
+          and all(np.allclose(z_sub.extrinsics(t)[1], z_sub.extrinsics(0)[1]) for t in range(T)))
+
+    #  Provenance: a warped path must round-trip, or meta.json no longer
+    #  describes the camera the pixels came from (the property gated on the
+    #  rig_check corpus).
+    check("speed_scale survives to_dict() in both models",
+          fast.to_dict()["motion"]["speed_scale"] == 2.0
+          and sample_any_path(np.random.default_rng(5), "subject:orbit", POS0, LOOK0,
+                              T, DT, speed_scale=2.0).to_dict()["speed_scale"] == 2.0)
+
+    # --- cross-layer dispatch ----------------------------------------------
+    #  One family namespace over two camera models. The failure this guards is
+    #  silent: `gait` means different motion in each model, so a bare name that
+    #  quietly picked one would produce a corpus that is not the one requested.
+    check("resolve: bare unique name -> right layer",
+          resolve_family("dolly") == ("subject", "dolly")
+          and resolve_family("dolly_in") == ("free", "dolly_in"))
+    check("resolve: prefixed names both work",
+          resolve_family("subject:gait") == ("subject", "gait")
+          and resolve_family("free:gait") == ("free", "gait"))
+    for bad, why in (("gait", "ambiguous bare name"),
+                     ("handheld", "ambiguous bare name"),
+                     ("nope", "unknown family"),
+                     ("free:nope", "unknown kind in a known layer"),
+                     ("weird:gait", "unknown layer")):
+        try:
+            resolve_family(bad)
+            check(f"resolve: {bad!r} rejected ({why})", False)
+        except ValueError:
+            check(f"resolve: {bad!r} rejected ({why})", True)
+
+    #  The az/el/d derivation moved into sample_any_path; if it round-trips the
+    #  rig pose wrong, every subject-anchored camera is posed somewhere the
+    #  visibility gate never approved.
+    rng_a = np.random.default_rng(11)
+    sub = sample_any_path(rng_a, "subject:orbit", POS0, LOOK0, T, DT)
+    check("dispatch: subject layer reproduces the rig pose at t=0",
+          np.allclose(sub.extrinsics(0)[1], POS0, atol=1e-9)
+          and np.allclose(sub.extrinsics(0)[0], R_legacy, atol=1e-9),
+          f"|dp|={np.linalg.norm(sub.extrinsics(0)[1] - POS0):.2e}")
+    check("dispatch: layers return their own path types",
+          type(sub).__name__ == "CameraPath"
+          and isinstance(sample_any_path(np.random.default_rng(11), "free:dolly_in",
+                                         POS0, LOOK0, T, DT), FreeCameraPath))
+    check("dispatch: sample_any_path == sample_camera_path for the same seed",
+          np.allclose(sub.to_dict()["az0"],
+                      sample_camera_path(
+                          np.random.default_rng(11), "orbit",
+                          math.atan2(POS0[1] - LOOK0[1], POS0[0] - LOOK0[0]),
+                          math.degrees(math.asin((POS0[2] - LOOK0[2])
+                                                 / np.linalg.norm(POS0 - LOOK0))),
+                          float(np.linalg.norm(POS0 - LOOK0)), LOOK0, DT).to_dict()["az0"]))
+
+    # --- roll_always on the free layer -------------------------------------
+    #  Different mechanism from the subject layer (constant frame-0 offset, not
+    #  an oscillating amplitude) and it must be a NO-OP on a family that already
+    #  commands roll — otherwise it would fight the family whose roll dynamics
+    #  are the point, and burn an rng draw that breaks twin reproducibility.
+    p_roll = sample_free_path(np.random.default_rng(5), "still", POS0, LOOK0, T, DT,
+                              roll_always=True)
+    g_roll = np.stack([p_roll.gravity_camera(t) for t in range(T)])
+    check("roll_always: injects tilt into a roll-free family",
+          np.abs(g_roll[:, 0]).max() > 1e-2,
+          f"|g.x|={np.abs(g_roll[:,0]).max():.4f} (constant over the clip)")
+    on = sample_free_path(np.random.default_rng(9), "dolly_in", POS0, LOOK0, T, DT,
+                          roll_always=True)
+    off = sample_free_path(np.random.default_rng(9), "dolly_in", POS0, LOOK0, T, DT)
+    check("roll_always: no-op (bit-identical) when the family already rolls",
+          all(np.allclose(on.extrinsics(t)[0], off.extrinsics(t)[0], atol=0.0)
+              and np.allclose(on.extrinsics(t)[1], off.extrinsics(t)[1], atol=0.0)
+              for t in range(T)))
 
     # --- user families -----------------------------------------------------
     todo = ([args.family] if args.family

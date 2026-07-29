@@ -22,6 +22,35 @@ and *why*, read [README.md](README.md) (the map) and the source-of-truth docs in
   (**what we're learning** — the hypothesis frontier; check it first for the
   current active line and what's parked/killed).
 
+## Where the data-gen code lives (2026-07-28)
+`src/data_gen/` is not flat any more — three modules own one concern each and the
+rest of the pipeline consumes them:
+- [camera_rig.py](src/data_gen/camera_rig.py) — **all** camera logic: propose,
+  gate, path, along-path gate, annotators, per-frame pose, per-frame log.
+  `extrinsics()` is world-frame and **gauge** (transform tier, not a target);
+  `egomotion()`/`gravity_camera()` are the label tier. Touch camera behaviour
+  here, not in `collect_clip`.
+- [cli.py](src/data_gen/cli.py) — every `ClipConfig`-override flag, declared once
+  and shared by both drivers. Adding a knob is a one-line table entry; adding it
+  to a driver's argparse instead re-creates the drift this replaced.
+- [camera_paths.py](src/data_gen/camera_paths.py) /
+  [camera_motion.py](src/data_gen/camera_motion.py) — pure numpy, no omni,
+  61 offline checks. Two camera *models*, one family namespace (`subject:` /
+  `free:`); the rig consumes both.
+- [clips_generator.py](src/data_gen/clips_generator.py) +
+  [collect_grid.py](src/data_gen/collect_grid.py) — corpus as a **plan** over
+  (room × scenario × view), not a config. `plan()`/`config_for()`/
+  `validate_pure()` import **no omni** and that is load-bearing: the driver
+  validates and prints the whole grid *before* `SimulationApp` is constructed
+  (`--dry_run` stops there). Keep it that way — one omni import at module level
+  in this chain silently costs a Kit boot per typo.
+
+## Which driver
+`collect_clip` = one scenario, N rollouts. `collect_corpus` = all scenarios, one
+camera policy, flat per-scenario dirs. `collect_grid` = explicit room/egomotion
+axes with per-cell yield + cost reporting. All three share `cli.py`, and all
+three call the same `collect_clip()` — only the *orchestration* differs.
+
 ## Source-of-truth rule
 When you change a load-bearing decision (anything under README §Best tactics or a
 `plans/*.md` spec), **update the relevant `plans/*.md` in the same commit.** The plans

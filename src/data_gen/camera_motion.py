@@ -32,14 +32,24 @@ velocity is returned in camera axes, so *forward is negative z* — use
 `surge_sway_heave()` rather than writing the sign by hand.
 """
 
+import dataclasses
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
-from camera_paths import look_at_basis   # shared basis; no omni deps
+from camera_paths import (              # shared basis + subject-anchored layer; no omni deps
+    FAMILIES as _PATH_FAMILIES,
+    look_at_basis,
+    sample_camera_path,
+)
 
 WORLD_UP = np.array([0.0, 0.0, 1.0])
+
+# Constant frame-0 roll handed to a roll-free family under `roll_always`
+# (degrees, random sign). Big enough that g_cam.x clears render/label noise,
+# small enough to stay a plausible shot rather than a Dutch-angle gimmick.
+ROLL0_DEG = (6.0, 18.0)
 
 
 def surge_sway_heave(surge=0.0, sway=0.0, heave=0.0):
@@ -136,15 +146,27 @@ class MotionModel:
         {"kind": "const", "v": (surge, sway, heave), "w": (pan, tilt, roll)}
         {"kind": "sine",  "v": (...), "w": (...), "freq_hz": f, "phase": p}
         {"kind": "ramp",  "v": (...), "w": (...), "t0": a, "t1": b}   # linear 0->1 over [a,b] frames
+
+    `speed_scale` is a TIME WARP, not a gain: the path becomes x(s*t), i.e. the
+    same trajectory traversed s times faster. That needs BOTH halves — evaluate
+    the term shapes at warped time AND multiply the result by s, since
+    d/dt x(s*t) = s * x'(s*t). Scaling only the output would stretch the shape
+    instead of replaying it: a `sine` roll term at 2x output amplitude integrates
+    to TWICE the roll angle, which is a different shot, not a faster one.
+    Set once from `ClipConfig.camera_speed_scale` so no family sampler has to
+    know the knob exists (see `sample_free_path`).
     """
     kind: str
     dt: float
     terms: tuple = ()
+    speed_scale: float = 1.0
 
     def velocity(self, t):
+        s = float(self.speed_scale)
+        tw = float(t) * s                      # warped FRAME index (ramps live here)
+        tt = tw * self.dt                      # warped seconds (sines live here)
         v = np.zeros(3)
         w = np.zeros(3)
-        tt = float(t) * self.dt
         for term in self.terms:
             k = term.get("kind", "const")
             if k == "const":
@@ -154,20 +176,24 @@ class MotionModel:
                              + float(term.get("phase", 0.0)))
             elif k == "ramp":
                 t0, t1 = float(term.get("t0", 0.0)), float(term.get("t1", 1.0))
-                g = 0.0 if t1 <= t0 else float(np.clip((t - t0) / (t1 - t0), 0.0, 1.0))
+                g = 0.0 if t1 <= t0 else float(np.clip((tw - t0) / (t1 - t0), 0.0, 1.0))
             else:
                 raise ValueError(f"unknown motion term kind {k!r}")
             sv, ss, sh = term.get("v", (0.0, 0.0, 0.0))
             pn, tl, rl = term.get("w", (0.0, 0.0, 0.0))
             v = v + g * surge_sway_heave(sv, ss, sh)
             w = w + g * pan_tilt_roll(pn, tl, rl)
-        return v, w
+        return s * v, s * w
 
     def is_zero(self):
-        return not self.terms
+        # speed_scale == 0 freezes the camera as surely as an empty term list;
+        # saying so here keeps the rig on the STATIC path, which skips the
+        # along-path gate and the per-frame prim re-posing (dynamic-camera.md 8.1).
+        return (not self.terms) or float(self.speed_scale) == 0.0
 
     def to_dict(self):
         return {"kind": self.kind, "dt": self.dt,
+                "speed_scale": float(self.speed_scale),
                 "terms": [dict(t) for t in self.terms]}
 
 
@@ -191,9 +217,15 @@ class FreeCameraPath:
 
         p = np.asarray(position0, dtype=np.float64).copy()
         R_wc = np.asarray(R_camera_world0, dtype=np.float64).T   # camera -> world
-        pos = np.empty((self.n_frames, 3))
-        rot = np.empty((self.n_frames, 3, 3))                    # camera -> world
-        for t in range(self.n_frames):
+        # Integrate ONE EXTRA pose (n_frames + 1). `egomotion_labels` differences
+        # frame t against t+1; without the spare sample the last frame would clamp
+        # to itself and log v_cam = omega_cam = 0 — a silently corrupted label on
+        # 1/T of every dynamic clip. CameraPath has no such issue (its pose is
+        # closed-form, so it extrapolates), and parity is the whole point here.
+        n_int = self.n_frames + 1
+        pos = np.empty((n_int, 3))
+        rot = np.empty((n_int, 3, 3))                            # camera -> world
+        for t in range(n_int):
             if self.track_target is not None and self.track_tau > 0.0:
                 R_wc = _track_toward(R_wc, p, self.track_target, self.track_tau)
             pos[t], rot[t] = p, R_wc
@@ -204,7 +236,9 @@ class FreeCameraPath:
 
     # --- CameraPath-compatible surface -----------------------------------
     def _idx(self, t):
-        return int(np.clip(int(t), 0, self.n_frames - 1))
+        # Upper bound is n_frames, not n_frames-1: index n_frames is the spare
+        # integration step that keeps last-frame egomotion honest (see __init__).
+        return int(np.clip(int(t), 0, self._pos.shape[0] - 1))
 
     def pose(self, frame_idx):
         """(camera_pos_world, look_at_world, roll_rad).
@@ -331,8 +365,18 @@ def sample_motion(rng, kind, dt, n_frames):
         "camera_motion.sample_motion (see _dolly_in for the template)")
 
 
+def motion_has_roll(motion):
+    """True if any term commands a non-zero roll rate.
+
+    Used to decide whether `roll_always` still owes this path a tilt-breaking
+    component — see `sample_free_path`.
+    """
+    return any(float(t.get("w", (0.0, 0.0, 0.0))[2]) != 0.0 for t in motion.terms)
+
+
 def sample_free_path(rng, kind, position0, look_at0, n_frames, dt,
-                     roll_rad0=0.0, track_target=None, track_tau=0.0):
+                     roll_rad0=0.0, track_target=None, track_tau=0.0,
+                     roll_always=False, roll0_deg=ROLL0_DEG, speed_scale=1.0):
     """Sample a 6-DoF path starting from a gated rig pose.
 
     `position0`/`look_at0` come from the existing rig solve, so frame 0 is
@@ -340,11 +384,166 @@ def sample_free_path(rng, kind, position0, look_at0, n_frames, dt,
     takes over. `track_tau` blends re-aiming at `track_target` (default: the
     look-at point) — free 6-DoF loses the subject fast, and a partial track is
     also what a real operator does.
+
+    `roll_always` is the free-layer counterpart of the same flag on
+    `sample_camera_path`, but it works differently and deliberately so: the
+    orbit layer injects an oscillating roll *amplitude*, whereas here a family
+    that already commands a roll RATE is left alone, and only a roll-free family
+    gets a constant roll OFFSET at frame 0. That offset survives the whole clip
+    (`_track_toward` preserves roll by construction), so it buys between-clip
+    tilt spread rather than within-clip — which is what the tilt head needs, and
+    it avoids fighting a family whose roll dynamics are the point.
     """
+    # `speed_scale` is stamped on AFTER sampling, never passed into
+    # `sample_motion`. Two reasons: a family sampler stays a pure description of
+    # its shot and cannot forget to apply the knob, and the RNG stream is
+    # untouched — the same seed yields the same shot at every speed, which is
+    # what makes a speed sweep a controlled comparison rather than a new corpus.
+    motion = dataclasses.replace(sample_motion(rng, kind, dt, n_frames),
+                                 speed_scale=float(speed_scale))
+    if roll_always and not motion_has_roll(motion):
+        roll_rad0 = math.radians(float(rng.uniform(*roll0_deg))) * float(rng.choice([-1.0, 1.0]))
     R_cw0, _ = look_at_basis(position0, look_at0, roll_rad=roll_rad0)
-    motion = sample_motion(rng, kind, dt, n_frames)
     return FreeCameraPath(
         motion, position0, R_cw0, n_frames,
         track_target=(look_at0 if track_target is None else track_target),
         track_tau=track_tau,
     )
+
+
+# ---------------------------------------------------------------------------
+# CROSS-LAYER DISPATCH — one family name space over both camera models
+# ---------------------------------------------------------------------------
+# Two layers now sample paths: `camera_paths` (subject-anchored: azimuth /
+# elevation / distance about a look-at, aim locked on the subject) and this one
+# (free 6-DoF). `handheld` and `gait` exist in BOTH and mean genuinely different
+# things — same shot, different model. Rather than pick a precedence rule that
+# would silently change meaning the day a name is added to the other module,
+# collides are a hard error and the caller disambiguates with a prefix:
+#
+#     "subject:gait"  -> camera_paths.sample_camera_path (orbit-parametrized)
+#     "free:gait"     -> sample_free_path                (6-DoF integration)
+#     "gait"          -> ValueError (ambiguous)
+#     "dolly"         -> subject layer  (unique, so no prefix needed)
+#     "dolly_in"      -> free layer     (unique)
+
+SUBJECT_ONLY = tuple(k for k in _PATH_FAMILIES if k not in MOTION_FAMILIES)
+FREE_ONLY = tuple(k for k in MOTION_FAMILIES if k not in _PATH_FAMILIES)
+AMBIGUOUS = tuple(k for k in MOTION_FAMILIES if k in _PATH_FAMILIES)
+ALL_FAMILIES = tuple(sorted(
+    [f"subject:{k}" for k in _PATH_FAMILIES] + [f"free:{k}" for k in MOTION_FAMILIES]))
+
+
+def resolve_family(name):
+    """'free:gait' -> ('free', 'gait'). Bare names resolve only if unambiguous."""
+    s = str(name)
+    if ":" in s:
+        layer, _, kind = s.partition(":")
+        if layer not in ("subject", "free"):
+            raise ValueError(f"unknown camera layer {layer!r} in {s!r}; "
+                             "expected 'subject:' or 'free:'")
+        table = _PATH_FAMILIES if layer == "subject" else MOTION_FAMILIES
+        if kind not in table:
+            raise ValueError(f"unknown {layer} camera family {kind!r}; expected {table}")
+        return layer, kind
+    if s in AMBIGUOUS:
+        raise ValueError(
+            f"camera family {s!r} exists in BOTH camera models and they behave "
+            f"differently — say 'subject:{s}' (orbit-parametrized, aim locked on "
+            f"the subject) or 'free:{s}' (6-DoF egocentric)")
+    if s in SUBJECT_ONLY:
+        return "subject", s
+    if s in FREE_ONLY:
+        return "free", s
+    raise ValueError(f"unknown camera path family {s!r}; expected one of {ALL_FAMILIES}")
+
+
+def implemented_families():
+    """The subset of ALL_FAMILIES that actually has a sampler behind it.
+
+    PROBES the real dispatch with a throwaway RNG instead of consulting a second
+    hand-maintained list. That is the whole point: `sample_motion`'s if-chain
+    stays the ONLY place that knows which families exist, so filling in a stub
+    needs no matching edit here and the two can never disagree. A list would
+    re-create exactly the drift `cli.py` was written to kill.
+
+    Cost is a few dozen numpy ops per family, all pure — no omni, no render.
+    """
+    out = []
+    for name in ALL_FAMILIES:
+        try:
+            check_family_implemented(name)
+        except ValueError:
+            continue
+        out.append(name)
+    return tuple(out)
+
+
+def check_family_implemented(name, dt=1.0 / 30.0, n_frames=64):
+    """Raise ValueError if `name` resolves but has no sampler yet.
+
+    Exists because "resolves" and "is implemented" are different questions and
+    only the first was being asked at argument-parse time. A stub family used to
+    pass validation, boot Isaac, build the scene and only then raise
+    NotImplementedError from inside `CameraRig.solve` — ~12 s and a full stage
+    load to learn something knowable in microseconds. Cheap checks belong before
+    expensive ones.
+
+    Probed through `sample_any_path`, so BOTH camera models go through the same
+    door and a future subject-layer stub is caught too. Only NotImplementedError
+    is converted; anything else is a real bug and propagates.
+    """
+    resolve_family(name)                      # unknown/ambiguous first
+    try:
+        sample_any_path(np.random.default_rng(0), name,
+                        np.array([2.0, 0.0, 1.6]), np.array([0.0, 0.0, 0.0]),
+                        int(n_frames), float(dt))
+    except NotImplementedError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def orbit_params(camera_pos, look_at):
+    """(azimuth_rad, elevation_deg, distance) of a camera about its look-at point.
+
+    The inverse of the subject-anchored parametrization, factored out so that
+    anything turning a concrete rig pose into a `CameraPath` uses ONE derivation
+    — `sample_any_path` below and `camera_rig.CameraRig.fixed` both go through
+    here rather than each re-deriving the trigonometry.
+    """
+    offset = np.asarray(camera_pos, dtype=np.float64) - np.asarray(look_at, dtype=np.float64)
+    d = float(np.linalg.norm(offset))
+    az = float(math.atan2(offset[1], offset[0]))
+    el_deg = float(math.degrees(math.asin(np.clip(offset[2] / max(d, 1e-9), -1.0, 1.0))))
+    return az, el_deg, d
+
+
+def sample_any_path(rng, name, camera_pos, look_at, n_frames, render_dt,
+                    el_clamp_deg=(12.0, 68.0), d_clamp=(0.8, 4.0),
+                    roll_always=False, track_tau=0.0, speed_scale=1.0):
+    """Sample a path of EITHER model from a gated rig pose. Single entry point.
+
+    Takes the rig pose directly (`camera_pos`, `look_at`) and derives the
+    azimuth / elevation / distance the subject-anchored layer needs, so callers
+    never have to know which model a family belongs to. Returns a `CameraPath`
+    or a `FreeCameraPath` — duck-compatible, both carry
+    pose/extrinsics/gravity_camera/is_static/to_dict.
+
+    `speed_scale` reaches both models here BECAUSE it is defined as a time warp
+    rather than as a per-family gain — the two models have nothing else in
+    common (one integrates body-frame velocities, the other evaluates a closed
+    form), but "evaluate at s*t" is meaningful in both. A gain would have needed
+    a different implementation per family and would not have been comparable
+    across them.
+    """
+    layer, kind = resolve_family(name)
+    cam = np.asarray(camera_pos, dtype=np.float64)
+    look = np.asarray(look_at, dtype=np.float64)
+    if layer == "free":
+        return sample_free_path(rng, kind, cam, look, n_frames, render_dt,
+                                track_tau=track_tau, roll_always=roll_always,
+                                speed_scale=speed_scale)
+
+    az, el_deg, d = orbit_params(cam, look)
+    return sample_camera_path(rng, kind, az, el_deg, d, look, render_dt,
+                              el_clamp_deg=el_clamp_deg, d_clamp=d_clamp,
+                              roll_always=roll_always, speed_scale=speed_scale)

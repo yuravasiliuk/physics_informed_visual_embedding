@@ -56,19 +56,22 @@ from. So test in this order:
 
 | # | Test | Isaac? | What it isolates |
 |---|---|---|---|
-| 1 | `verify_camera_paths.py` (18 checks) + `verify_camera_motion.py [--all]` | no | trajectory math alone: legacy-basis equality, roll breaking `g.x≡0`, orbit/dolly = zero tilt, USD Euler round trip, SO(3) drift, command round trip, tracking-preserves-roll, determinism, clamps |
-| 2 | **Static bodies + MOVING camera** | yes | *pure logging/extrinsics*. Every logged `com_camera(t)` must equal the analytic reprojection of a FIXED world point through `R_cw(t)`. No physics involved → any error is wiring |
-| 3 | **Moving bodies + STATIC camera** | yes | the existing closed-form suite (ballistic, `spin_cuboid`, `two_body`) — must still pass **bit-identically**, proving the refactor didn't disturb the zero-coefficient path |
-| 4 | **Both moving** | yes | only now: egomotion identity — logged `v_cam`/`ω_cam` must match finite differences of the logged extrinsics; and `g_cam(t+1) == R_rel(t)·g_cam(t)` on LOGGED data (the offline version already passes, so a failure here is wiring, not math) |
+| 1 | `verify_camera_paths.py` (18 checks) + `verify_camera_motion.py [--all]` (40) | no | trajectory math alone: legacy-basis equality, roll breaking `g.x≡0`, orbit/dolly = zero tilt, USD Euler round trip, SO(3) drift, command round trip, tracking-preserves-roll, last-frame egomotion ≠ clamped zero, family-name resolution (`subject:` / `free:`), determinism, clamps |
+| 1b | `diagnose_camera_pose.py` | yes (seconds) | **posing, isolated from everything else.** Reads the camera prim's transform back off the live stage and compares it to the matrix we sent. No physics, no bodies, 64×64 render products. Run this BEFORE any capture whenever camera posing changes — it is the only check that sees what USD actually did, and it caught the `Camera_Xform`/`Camera` frame-adapter bug that all 40 offline checks passed straight through |
+| 2 | **Static bodies + MOVING camera** — `verify_forward_motion.py` | yes | *pure logging/extrinsics*. Every logged `com_camera(t)` must equal the analytic reprojection of a FIXED world point through `R_cw(t)`. No physics involved → any error is wiring. **The convention gate:** 10 s of steady forward motion, then assert rendered central depth FALLS by ≈ the distance travelled. Off-Isaac checks only prove our arithmetic is self-consistent; if USD's reading of `rotateXYZ`+translate were inverted, all 40 offline checks still pass and every dynamic clip dollies backwards. Demonstrated: on a synthetic flipped clip, all 8 trajectory checks pass and only the depth check catches it |
+| 2b | **Per-frame label gate** — `verify_physics_labels.py --case moving_camera` | yes | *the labels*, where step 2 covers the camera. Reconstructs world CoM from `com_camera(t)` through `R_cw(t)` and compares to `get_world_pose` (camera-agnostic), so it is exact whether bodies move or not and a residual has no physics component to argue about. Includes a **frame-shifted negative control**: the same reprojection with frame `t+1`'s extrinsics must be far worse (13.5 mm vs ~1e-16), else the test passes vacuously and a real off-by-one walks through |
+| 3 | **Moving bodies + STATIC camera** | yes | the existing closed-form suite (ballistic, `spin_cuboid`, `two_body`) — must still pass **bit-identically**, proving the refactor didn't disturb the zero-coefficient path. NOTE (2026-07-28): the four verify cases build their camera via `CameraRig.fixed`/`from_paths`, which **bypass `CameraRig.solve`** — so 4/4 here says nothing about pose proposal, the t=0 coverage gate, path sampling or the along-path gate. Only a real `collect_clip` run covers those; a 3-rollout `collide` run has now done so for STATIC paths (20/21 cameras, provenance→extrinsics exact), leaving the dynamic branch to step 6 |
+| 4 | **Both moving** | yes | folded into step 2b, which runs tumbling bodies under a `handheld`+roll path: egomotion vs finite differences of the logged extrinsics, `g_cam` unit-norm, and `g_cam(t+1) == R_rel(t)·g_cam(t)` on the LOGGED records. The offline versions already pass, so a failure here is wiring, not math |
 | 5 | **Contact impulse** — generate with `--log_contacts`, then `python3 src/data_gen/verify_contacts.py --data <corpus>` | gen only | `J_net ≈ m·Δv − m·g·Δt` per body per frame. **The trust gate for every contact label.** Residuals are split ground vs body-body because a flipped actor0/actor1 reaction fails body-body while ground still passes |
 | 6 | Smoke batch per camera family (§2 below) | yes | drop rate from path-aware visibility gating; framing survives the whole path |
 | 7 | `material_oracle --event_features` on the pilot | no | **acceptance**: restitution must reproduce ≈ +0.2 R² (event-anchored). A drop means the rebuild changed impact statistics |
 | 8 | Tilt non-degeneracy | no | `|g_cam.x|` spread > 0 **and** single-frame decodability ≪ full-clip (else it is still a horizon detector) |
 | 9 | Egomotion flow bound | no | egomotion-induced flow must not dominate object flow ([dynamic-camera.md §9.4](dynamic-camera.md)) |
 
-**Dead check to remove:** `offset_com` in `verify_physics_labels` tested the
-authored-CoM path, which is abandoned (EXPERIMENTS.md Graveyard). Deleting it is
-part of the CoM scrub, not a regression.
+**Done 2026-07-28:** the `offset_com` case is removed — it tested the authored-CoM
+path, abandoned with the target (EXPERIMENTS.md Graveyard). Its two surviving
+guarantees (the `get_world_pose` double-count guard and the world←camera
+reconstruction check) live on in `composite` and in `moving_camera`.
 
 ---
 
@@ -87,14 +90,15 @@ ${ISAAC_SIM}/python.sh src/data_gen/verify_collect_clip.py \
     --result ~/data/verify_collect_clip
 
 # Four closed-form cases on the PRODUCTION camera/code path:
-#   spin_cuboid — constant torque-free ω, +Z-only orientation increment
-#   offset_com  — authored offset CoM equals read_local_com (the W2 scale-fix
-#                 regression); world-CoM z second-difference = -g·render_dt²
-#   two_body    — per-body state stays matched to the right body (no index swap)
+#   spin_cuboid   — constant torque-free ω, +Z-only orientation increment
+#   two_body      — per-body state stays matched to the right body (no index swap)
+#   composite     — PhysX's integrated mass/CoM equal the analytic ΣρV form
+#   moving_camera — per-frame extrinsics: camera-frame labels reproject back onto
+#                   get_world_pose, + g_cam equivariance, + an off-by-one control
 ${ISAAC_SIM}/python.sh src/data_gen/verify_physics_labels.py \
     --result ~/data/verify_physics_labels
 # one case only:
-${ISAAC_SIM}/python.sh src/data_gen/verify_physics_labels.py --case offset_com
+${ISAAC_SIM}/python.sh src/data_gen/verify_physics_labels.py --case moving_camera
 ```
 
 `${ISAAC_SIM}` is your Isaac Sim install; the scripts pin the asset root to

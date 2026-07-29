@@ -15,7 +15,8 @@ import numpy as np
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from camera_paths import (  # noqa: E402
-    CameraPath, egomotion_labels, euler_xyz_deg_to_rotmat, look_at_basis,
+    REPLICATOR_CAMERA_CORRECTION, CameraPath, egomotion_labels,
+    euler_xyz_deg_to_rotmat, look_at_basis, replicator_rotation_xyz_deg,
     sample_camera_path, usd_rotation_xyz_deg,
 )
 
@@ -165,6 +166,36 @@ def main():
             rx, ry, rz = usd_rotation_xyz_deg(R_cw)
             ok &= np.allclose(euler_xyz_deg_to_rotmat(rx, ry, rz), R_cw.T, atol=1e-9)
     check("USD rotateXYZ round-trips to the logged extrinsics", ok)
+
+    # 12b. ★ THE REPLICATOR PRIM-CHAIN MODEL. Check 12 above is necessary but was
+    #      NOT sufficient: it proves our decomposition inverts itself, and that
+    #      held while the rendered camera was cyclically permuted (2026-07-28,
+    #      caught only by looking at pixels — diagnose_camera_pose.py). What is
+    #      actually rendered is `E_parent @ C`, because rep.modify.pose writes to
+    #      Camera_Xform and the child Camera prim adds a fixed (90,0,90) adapter.
+    #      So the angles we SEND must satisfy that composition, not the identity.
+    ok = True
+    for kind in ("static", "roll", "handheld", "gait", "arc", "orbit", "dolly"):
+        pth = sample_camera_path(np.random.default_rng(13), kind, az, el, d, look, DT,
+                                 roll_always=True)
+        for t in range(0, 64, 7):
+            R_cw, _ = pth.extrinsics(t)
+            E = euler_xyz_deg_to_rotmat(*replicator_rotation_xyz_deg(R_cw))
+            ok &= np.allclose(E @ REPLICATOR_CAMERA_CORRECTION, R_cw.T, atol=1e-9)
+    check("★ posed rotation @ Replicator child correction == the logged extrinsics", ok)
+    # The correction must be a genuine rotation, not just any permutation — a
+    # transposed or reflected constant would still round-trip above by symmetry.
+    C = REPLICATOR_CAMERA_CORRECTION
+    check("Replicator correction is in SO(3)",
+          np.allclose(C @ C.T, np.eye(3)) and abs(np.linalg.det(C) - 1.0) < 1e-12)
+    # And it must genuinely DO something: if C were identity the old (broken)
+    # code and the fixed code would be indistinguishable, so pin the difference.
+    R_cw, _ = sample_camera_path(
+        np.random.default_rng(13), "roll", az, el, d, look, DT).extrinsics(0)
+    check("correction actually changes the posed angles (not a silent no-op)",
+          not np.allclose(replicator_rotation_xyz_deg(R_cw), usd_rotation_xyz_deg(R_cw)),
+          f"raw={tuple(round(a,2) for a in usd_rotation_xyz_deg(R_cw))} "
+          f"posed={tuple(round(a,2) for a in replicator_rotation_xyz_deg(R_cw))}")
 
     # 11c. A look-at-only camera CANNOT express roll — the reason the dynamic
     #      path must set an explicit rotation (usd_rotation_xyz_deg docstring).

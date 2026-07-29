@@ -37,7 +37,7 @@ change) rather than keep two copies of the basis math.
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -131,6 +131,38 @@ def usd_rotation_xyz_deg(R_camera_world):
     return tuple(math.degrees(a) for a in (rx, pitch, rz))
 
 
+# Replicator does not build a camera as one prim. `rep.create.camera` creates
+# `Camera_Xform` (the prim `rep.modify.pose` writes to) with a CHILD `Camera`
+# prim carrying a fixed `rotateXYZ=(90, 0, 90)` — the adapter from the USD camera
+# frame (+Y up, -Z forward) to the Z-up stage. USD composes child-then-parent, so
+# in column convention the rendered camera->world matrix is
+#
+#     M_world = E_parent @ C          with C = Rz(90) @ Rx(90)
+#
+# Posing the parent with M_target therefore renders M_target @ C — a CYCLIC ROW
+# PERMUTATION of the intended basis, which reads on screen as the camera moving
+# sideways rather than forward. Measured against the live stage and reproduced
+# exactly by this model (diagnose_camera_pose.py, 2026-07-28).
+#
+# The correction is a property of Replicator's prim layout, NOT of USD's Euler
+# convention — `usd_rotation_xyz_deg` above is a correct decomposition and stays
+# untouched. Only the value handed to `rep.modify.pose` needs pre-multiplying.
+REPLICATOR_CAMERA_CORRECTION = np.array([[0.0, 0.0, 1.0],
+                                         [1.0, 0.0, 0.0],
+                                         [0.0, 1.0, 0.0]])
+
+
+def replicator_rotation_xyz_deg(R_camera_world, correction=REPLICATOR_CAMERA_CORRECTION):
+    """Euler angles for `rep.modify.pose(rotation=)` on a Replicator camera.
+
+    Solves `E @ C = R_camera_world.T` for E, i.e. decomposes `C @ R_camera_world`.
+    Validated two ways: the algebra round-trips offline (verify_camera_paths.py),
+    and on a live stage it reproduces the parent rotation that the known-good
+    `rep.create.camera(look_at=...)` path writes for the same pose.
+    """
+    return usd_rotation_xyz_deg(np.asarray(correction) @ np.asarray(R_camera_world))
+
+
 def euler_xyz_deg_to_rotmat(rx, ry, rz):
     """Inverse of `usd_rotation_xyz_deg` (camera->world matrix). Test hook: the
     round trip must reproduce R_camera_world.T to machine precision, otherwise
@@ -182,10 +214,16 @@ class CameraPath:
     jitter: tuple = ()               # 3 tuples of sinusoid components (x, y, z)
     bob_amp: float = 0.0
     bob_freq_hz: float = 0.0
+    # TIME WARP — the same shot traversed `speed_scale` times faster. This model
+    # is a POSITIONAL parametrization (velocity is only the derivative of
+    # `pose`), so unlike the free 6-DoF model the warp is exact and needs no
+    # output gain: scaling the time argument IS x(s*t). Default 1.0 leaves every
+    # existing path and every stored meta.json bit-identical.
+    speed_scale: float = 1.0
 
     def pose(self, frame_idx):
         """(camera_pos_world, look_at_world, roll_rad) at a rendered frame."""
-        t = float(frame_idx) * self.dt
+        t = float(frame_idx) * self.dt * float(self.speed_scale)
 
         az = self.az0 + math.radians(self.omega_az_dps) * t
         el_deg = self.el0_deg + self.el_amp_deg * math.sin(
@@ -226,7 +264,10 @@ class CameraPath:
         return R_cw @ np.array([0.0, 0.0, -1.0])
 
     def is_static(self):
-        return self.kind == "static" or not (
+        # speed_scale == 0 freezes every time-dependent term, so the path is
+        # static in fact — report it, or the rig pays the along-path gate and
+        # per-frame re-posing for a camera that never moves.
+        return self.kind == "static" or float(self.speed_scale) == 0.0 or not (
             self.omega_az_dps or self.el_amp_deg or self.d_amp_frac
             or self.roll_amp_deg or self.jitter or self.bob_amp)
 
@@ -240,7 +281,7 @@ class CameraPath:
 
 def sample_camera_path(rng, kind, az_center, el_center_deg, distance, look_at,
                        render_dt, el_clamp_deg=(12.0, 68.0), d_clamp=(0.8, 4.0),
-                       roll_always=False):
+                       roll_always=False, speed_scale=1.0):
     """Sample one seed-deterministic path of the given family.
 
     `az_center` / `el_center_deg` / `distance` / `look_at` come from the EXISTING
@@ -261,7 +302,7 @@ def sample_camera_path(rng, kind, az_center, el_center_deg, distance, look_at,
     p = dict(kind=kind, az0=float(az_center), el0_deg=float(el_center_deg),
              d0=float(distance), look0=tuple(float(x) for x in look_at),
              dt=float(render_dt), el_clamp_deg=tuple(el_clamp_deg),
-             d_clamp=tuple(d_clamp))
+             d_clamp=tuple(d_clamp), speed_scale=float(speed_scale))
 
     def _roll():
         p["roll_amp_deg"] = float(rng.uniform(*ROLL_AMP_DEG)) * rng.choice([-1.0, 1.0])

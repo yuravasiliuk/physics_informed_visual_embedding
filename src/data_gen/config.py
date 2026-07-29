@@ -65,8 +65,24 @@ class ClipConfig:
     # A camera path is sampled per rig camera; `static` is the ZERO-COEFFICIENT
     # case of the same parametrization, so the default below reproduces the
     # legacy corpus exactly and the knob is opt-in.
-    camera_path_families: tuple = ("static",)      # any of camera_paths.FAMILIES
+    # Names span BOTH camera models and are resolved by
+    # `camera_motion.resolve_family`: subject-anchored (camera_paths.FAMILIES —
+    # aim locked on the look-at point) and free 6-DoF (camera_motion.
+    # MOTION_FAMILIES). `handheld`/`gait` exist in both and MUST be prefixed
+    # ("subject:gait" / "free:gait"); everything else resolves bare.
+    camera_path_families: tuple = ("static",)
     camera_path_weights: tuple = None              # None = uniform over families
+    # Global TIME WARP on every sampled path, both camera models: the same shot
+    # traversed this many times faster (2.0 = twice the travel over the same
+    # frame_count, 0.5 = half). Applied once in the samplers, so no family has to
+    # know it exists and the RNG stream is untouched — the same seed gives the
+    # SAME shot at every speed, which makes a speed sweep a controlled
+    # comparison. 1.0 leaves every existing path bit-identical.
+    # ⚠ Raising this fights the §9.4 acceptance gate: egomotion-induced image
+    # flow must not dominate object-induced flow, and flow scales linearly here.
+    # It also increases along-path gate drops, since a faster camera leaves the
+    # framed volume sooner (dynamic-camera.md §8.1).
+    camera_speed_scale: float = 1.0
     # Force a roll component on every sampled path. THIS IS THE DEGENERACY
     # BREAKER: gravity tilt in camera frame is `R_cw @ (0,0,-1)`, and a look-at
     # basis has zero roll by construction ⇒ g_cam.x ≡ 0. Orbit (pure yaw about
@@ -78,6 +94,15 @@ class ClipConfig:
     # one of them); a camera is dropped if any sample fails coverage, so the
     # action stays framed for the whole clip, not just at the first frame.
     camera_path_gate_samples: int = 4
+    # Free-6-DoF families only (the subject-anchored model tracks by
+    # construction): per-frame blend toward re-aiming at the look-at point.
+    # 0 = dead reckoning — honest egomotion, but the subject exits frame and the
+    # along-path gate then drops the camera, so a free-heavy batch at tau=0 pays
+    # in yield. ~0.1-0.3 imitates an operator following loosely; 1 = locked on,
+    # which collapses the free model back onto subject-anchored behaviour.
+    # Tracking is a MINIMAL rotation and preserves roll, so it does not undo
+    # camera_roll_always (asserted in verify_camera_motion.py).
+    camera_track_tau: float = 0.0
 
     # --- contact events (contact_log.py) ------------------------------------
     # Solver-exact impulses at PHYSICS rate. Load-bearing, not optional extra:
@@ -114,19 +139,12 @@ class ClipConfig:
     # steel(8000). Without this, mass = 1000·volume and a "predict mass" probe
     # only ever learns visible size.
     density_range: tuple = (200.0, 8000.0)
-    # Per-body CoM offset as a fraction of each half-extent (W2 / R7). Authored
-    # via MassAPI so the CoM-offset label has real variance instead of being
-    # identically zero. 0.3 keeps the CoM well inside the collision volume
-    # (sphere worst case: 0.3*sqrt(3)*r ~= 0.52 r < r). Appearance gives no cue.
-    com_offset_frac: float = 0.3
-    # Optional absolute CoM-offset sampling (probe-corpus-spec.md). When set to a
-    # (min,max) metre range, the primitive CoM offset is drawn as an ABSOLUTE
-    # magnitude in metres in a random direction (clamped to com_offset_frac of the
-    # half-extent so it stays inside the body), instead of frac*half_extent. This
-    # breaks |CoM| ~ size (coverage audit found |CoM|~size +0.34..0.62), so a
-    # frozen probe cannot recover CoM via visible silhouette (R8). None = legacy
-    # fractional behaviour (default, backward-compatible). Non-retrofittable knob.
-    com_offset_abs_range: tuple = None
+    # REMOVED 2026-07-28 with the CoM target (EXPERIMENTS.md Graveyard):
+    # `com_offset_frac` and `com_offset_abs_range`, which authored a per-primitive
+    # offset CoM (W2) and then de-correlated its magnitude from body size. Both
+    # existed only to give the CoM-offset *label* variance. Primitives now carry
+    # PhysX's computed CoM (the centroid). Composites below are unaffected.
+    #
     # Composite glued bodies (physics-diversification.md W5). A fraction of
     # dynamic bodies are built as a uniform-colour cuboid internally split into
     # 2-3 contiguous density slabs, so the offset CoM *emerges* from a real mass
@@ -268,52 +286,26 @@ TOPPLE_SHAPES = ("cuboid", "cylinder")       # only shapes with a flat base to s
 # --- collide ----------------------------------------------------------------
 # Two bodies on a shared horizontal axis aimed at each other; momentum exchange
 # makes the mass ratio observable (mass decoupled from volume by W1).
-COLLIDE_HALF_SEP_RANGE = (0.30, 0.42)        # m, each body's distance from origin
-COLLIDE_SPEED_RANGE = (1.5, 6.0)            # m/s, horizontal closing speed per body
+# RETUNED 2026-07-28 after the first --log_contacts run dropped 5/6 rollouts with
+# "no viewable camera". The old values were structurally un-framable, not merely
+# unlucky, and two numbers show it:
+#   * `framing_distance` clamps at camera_radius_clamp[1]=4 m, so at
+#     frame_fill_frac=0.4 the largest framable cloud is r = 4·0.4·0.582 = 0.93 m;
+#     the old (1.5-6.0) m/s spread the pair to 1.6 m by frame 24 even at its
+#     SLOWEST draw.
+#   * min_body_coverage=0.01 is tighter still: two ~0.1 m bodies fill 1% of
+#     1024² only within ~1.3 m of the camera, where the framable radius is
+#     0.31 m — and the old spawn already put them at 0.30-0.42 m before moving.
+# Raising the distance clamp cannot fix it (at 8.7 m the bodies render ~11 px,
+# 0.02% coverage). So the action is compacted instead. What `collide` is FOR is
+# the momentum exchange m1·Δv1 = −m2·Δv2, and the mass information lives in the
+# Δv RATIO, not its magnitude — the high speeds bought nothing and cost the clip.
+COLLIDE_HALF_SEP_RANGE = (0.18, 0.28)        # m, each body's distance from origin
+COLLIDE_SPEED_RANGE = (0.6, 1.5)             # m/s, horizontal closing speed per body
 COLLIDE_HEIGHT_RANGE = (0.12, 0.22)          # m, shared spawn height of both centers
 COLLIDE_AIM_JITTER_DEG = 8.0                 # max ± aim jitter so it's not perfectly 1D
+# Larger bodies than the default scale_range (0.05-0.15): pixel coverage goes as
+# (size/distance)², so this is the cheapest way to clear min_body_coverage
+# without moving the camera closer and shrinking the framable volume.
+COLLIDE_SCALE_RANGE = (0.10, 0.20)           # m; per-axis (cuboid) or radius/height
 
-# --- balance ------------------------------------------------------------------
-# W6 — CoM-observability-first (physics-diversification.md W6). The com_oracle
-# (results/probe/com_oracle) showed CoM is NOT decodable even from GT
-# trajectories on the v2 corpus: W3a's topple guarantees motion by
-# OVERDETERMINING it — leaning 3-8° PAST critical toward a random azimuth
-# decides the outcome before the offset can matter. `balance` inverts that:
-# lean is sampled in a narrow band AROUND the GEOMETRIC critical angle, so
-# whether the body tips or rocks back — and how fast — is decided by where its
-# invisible (W2/W5, R8) CoM actually sits. The authored offset (≤0.3·half-
-# extent) shifts the TRUE threshold by up to ~±5°, wider than the ±2.5° band,
-# so the offset is the deciding variable for most draws.
-BALANCE_N_RANGE = (1, 2)                     # inclusive
-# Pilot retune (2026-07-05, pilot_w6, n=31 bodies): the ±2.5° band tipped 84% —
-# the EMPIRICAL boundary sits below the geometric theta_crit (kick + the 5 mm
-# settle-drop jolt push knife-edge bodies over), so the band is re-centred
-# negative to target ~50% tip rate, and the kick is cut to near-zero. The
-# design mechanism is confirmed: corr(tipped, offset-toward-tip) = +0.34,
-# BEATING the geometric margin (+0.28) in the contested band (§W6).
-BALANCE_LEAN_BAND_DEG = (-4.5, 0.5)          # sampled AROUND theta_crit, re-centred on the empirical boundary
-BALANCE_KICK_ANGVEL_RANGE = (0.0, 0.05)      # rad/s, ~zero: nothing may swamp the offset
-# Footprint / height / XY / clearance / tip-jitter / shapes reuse TOPPLE_*.
-
-# --- eccentric_roll -------------------------------------------------------------
-# W6 — CoM-observability-first, continuous variant. Rolling couples the offset
-# to macroscopic motion the entire clip: an offset-CoM cylinder/sphere rolls
-# like an eccentric wheel (speed oscillation at the rotation frequency, curved
-# path for spheres) and settles CoM-low, so the REST ORIENTATION reads out the
-# offset direction in the body frame. Primitives only (composites are cuboids —
-# they don't roll); offset authored invisibly by spawn_body (R8).
-ECCROLL_N_RANGE = (1, 3)                     # inclusive
-ECCROLL_SHAPES = ("cylinder", "sphere")
-ECCROLL_RADIUS_RANGE = (0.05, 0.10)          # m
-ECCROLL_LENGTH_RANGE = (0.15, 0.30)          # m, cylinder length (axis horizontal)
-# Pilot retunes (2026-07-05, pilot_w6 + _v2): rest fraction stayed ~14% even at
-# 0.4-1.2 m/s × 128 frames — with angular damping deliberately zeroed (W4) and
-# no PhysX rolling resistance, pure rolling is LOSSLESS, so most rollers never
-# rest regardless of speed/length. Reframe (§W6): the readout is the terminal
-# OSCILLATION AROUND the CoM-low pose (a frictionless pendulum), which the
-# trajectory carries the whole clip; the few bodies that do rest confirm the
-# channel (cos(offset, down) med +0.88..+0.97). Keep slow speeds (wobble
-# resolution) + --frame_count 128 (more oscillation cycles on film).
-ECCROLL_SPEED_RANGE = (0.4, 1.2)             # m/s — slow, so the wobble modulates motion visibly
-ECCROLL_XY_RANGE = (-0.30, 0.30)
-ECCROLL_GROUND_CLEARANCE = 0.005             # spawn just clear of ground

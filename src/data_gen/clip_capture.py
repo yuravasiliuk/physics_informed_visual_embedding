@@ -23,7 +23,7 @@ from config import ClipConfig
 # truth) so existing `from clip_capture import quantize_depth_uint16` keeps working.
 from depth_map_factory import DepthMapFactory, quantize_depth_uint16  # noqa: F401
 # Pure-numpy trajectory layer (no omni deps) — dynamic-camera.md §6.
-from camera_paths import egomotion_labels, look_at_basis, usd_rotation_xyz_deg
+from camera_paths import egomotion_labels, look_at_basis, replicator_rotation_xyz_deg
 
 # Camera intrinsics — the single source for both the live capture cameras
 # (make_annotators) and the framing-distance solver (framing_distance). Keep
@@ -93,10 +93,18 @@ def set_camera_pose(annots, camera_position, R_camera_world):
 
     Call BEFORE `world.step(render=True)` for that frame, so frame t is rendered
     from pose t.
+
+    Uses `replicator_rotation_xyz_deg`, NOT `usd_rotation_xyz_deg`:
+    `rep.modify.pose` writes to the `Camera_Xform` PARENT, and the child `Camera`
+    prim carries a fixed (90,0,90) frame adapter that post-multiplies whatever we
+    send. Posing with the raw matrix renders a cyclic permutation of the intended
+    basis — which looks like sideways TRAVEL rather than a mis-aimed camera, so
+    it reads as a path bug and is easy to chase in the wrong module
+    (diagnose_camera_pose.py).
     """
     with annots["_camera"]:
         rep.modify.pose(position=tuple(float(x) for x in camera_position),
-                        rotation=usd_rotation_xyz_deg(R_camera_world))
+                        rotation=replicator_rotation_xyz_deg(R_camera_world))
     return R_camera_world
 
 
@@ -323,11 +331,13 @@ def read_local_com(body):
     origin — the exact bug step 5.7 is fixing.
 
     Must be called after `world.reset()` (when the physics view is created).
-    Since W2 every primitive carries an authored offset CoM (scale-corrected in
-    body_factory.attach_center_of_mass), so this returns that offset — the
-    physical body-local CoM PhysX integrates — not zeros. It must equal the
-    logged `com_local_authored` (asserted by the offset_com verify case); a
-    uniform body with no authored offset would still read zeros.
+
+    Returns the CoM PhysX actually integrates. Since the W2 authored offset was
+    removed (2026-07-28, with the CoM target) this is ~zero for a uniform
+    primitive — its CoM *is* the prim origin — and stays genuinely non-zero for
+    composites (W5), whose offset emerges from the density split and must match
+    the closed-form `com_local_analytic`. So it is still load-bearing: it is what
+    makes `com_camera` the CoM rather than the prim origin for those bodies.
     """
     com_pos, _ = body.get_com()
     return np.asarray(com_pos, dtype=np.float64).reshape(3)
@@ -339,9 +349,10 @@ def log_state_frame(bodies, local_coms, frame_idx, records, R_camera_world, came
     `local_coms[i]` is the body-local CoM offset (read once post-reset via
     read_local_com). World CoM = prim_origin + R(quat_body_world) @ com_local —
     `get_world_pose` returns the prim origin, not the CoM (settled by the W4
-    offset_com verify: reconstructed CoM xy is constant under spin, no
-    double-count). Since W2 com_local is the authored offset for every primitive
-    (it only collapses to the prim origin for a body with no authored offset).
+    offset_com verify: reconstructed CoM xy was constant under spin, so there is
+    no double-count). With the W2 authored offset removed, `com_local` is ~zero
+    for uniform primitives and non-zero only for composites — the composition
+    stays correct either way, which is why it is kept rather than simplified.
 
     All vectors and orientations are stored in **camera frame**. World frame is
     recoverable from `R_camera_world` in meta.json if downstream code needs it.

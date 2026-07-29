@@ -49,11 +49,7 @@ from config import (
     TOPPLE_KICK_ANGVEL_RANGE, TOPPLE_LEAN_MARGIN_DEG, TOPPLE_TIP_JITTER_DEG,
     TOPPLE_XY_RANGE, TOPPLE_GROUND_CLEARANCE, TOPPLE_SHAPES,
     COLLIDE_HALF_SEP_RANGE, COLLIDE_SPEED_RANGE, COLLIDE_HEIGHT_RANGE,
-    COLLIDE_AIM_JITTER_DEG,
-    BALANCE_N_RANGE, BALANCE_LEAN_BAND_DEG, BALANCE_KICK_ANGVEL_RANGE,
-    ECCROLL_N_RANGE, ECCROLL_SHAPES, ECCROLL_RADIUS_RANGE,
-    ECCROLL_LENGTH_RANGE, ECCROLL_SPEED_RANGE, ECCROLL_XY_RANGE,
-    ECCROLL_GROUND_CLEARANCE,
+    COLLIDE_AIM_JITTER_DEG, COLLIDE_SCALE_RANGE,
 )
 
 
@@ -568,7 +564,7 @@ def _axis_angle_rotmat(axis, angle):
 def _topple_lean_pose(rng, shape, dims, center_xy,
                       lean_band_deg=TOPPLE_LEAN_MARGIN_DEG,
                       kick_range=TOPPLE_KICK_ANGVEL_RANGE):
-    """Lean a tall body about its geometric tip angle (W3a topple / W6 balance).
+    """Lean a tall body about its geometric tip angle (W3a topple).
 
     Returns (position_world, orientation_wxyz, ang_vel_world, lean_deg,
     tip_az_rad, theta_crit_deg). The body is tilted by theta_crit + a draw
@@ -576,7 +572,7 @@ def _topple_lean_pose(rng, shape, dims, center_xy,
     φ, then raised so its lowest tilted vertex rests at ground+clearance
     (no t=0 penetration). An angular kick `mag·axis` (mag from `kick_range`)
     continues the tip toward φ. Defaults reproduce topple (strictly past
-    critical) with identical RNG draws; `balance` passes a band straddling
+    critical) with identical RNG draws; the retired `balance` passed a band straddling
     zero and a ~zero kick so the CoM offset decides the outcome (W6).
     """
     he = body_factory.half_extents(shape, dims)          # (hx, hy, hz)
@@ -693,206 +689,16 @@ def build_topple(world, rng, config):
     return bodies, body_specs, scene_specs, initial_velocities
 
 
-# --- balance ----------------------------------------------------------------
-# W6 CoM-observability-first scenario (physics-diversification.md W6). The
-# com_oracle showed the v2 corpus never lets the CoM offset DECIDE anything:
-# topple (W3a) leans 3-8° PAST critical, so the outcome is fixed before the
-# offset can matter. Here the lean is drawn from a narrow band AROUND the
-# GEOMETRIC critical angle (BALANCE_LEAN_BAND_DEG, straddling zero) with a
-# ~zero kick: whether the body tips or rocks back — and how fast — is decided
-# by where its invisible CoM sits (authored offset shifts the true threshold
-# by up to ~±5°, wider than the ±2.5° band). Tip / no-tip, direction, and
-# timing are all macroscopic offset readouts (R6).
+# RETIRED 2026-07-28: `build_balance` (W6) and `build_eccentric_roll` (W6) lived
+# here. Both were designed so the **authored offset CoM** decided the outcome —
+# balance leaned a body in a narrow band around theta_crit; eccentric_roll rolled
+# an offset-CoM cylinder like a loaded die. `body_factory.attach_center_of_mass`
+# was removed with the CoM target, so neither scenario can do what it claims any
+# more: they would run and silently produce geometry-only physics. Moved verbatim
+# to src/legacy/com_scenarios.py (with their config constants) — the *design*
+# idea, "put the quantity in a contested band rather than overdetermining the
+# outcome", is the durable part and is reused by the event-anchored targets.
 
-# Tunables: config.BALANCE_*; footprint/height/XY/shapes reuse TOPPLE_*.
-
-
-def build_balance(world, rng, config):
-    """1-2 tall bodies leaning AT their geometric tip angle; the CoM decides (W6).
-
-    DEPRECATED (2026-07-27): built solely to make the CoM offset observable, and
-    CoM is abandoned (EXPERIMENTS.md Graveyard). Dropped from the rebuild — it is
-    also weak for the replacement targets: a near-equilibrium scenario produces
-    few high-energy impacts, and restitution needs `e·|vz_in| > g·Δt`. Never in
-    `config.scenarios` (pilots invoked it explicitly), so nothing changes by
-    default. Kept callable per CLAUDE.md §Retire-don't-delete; remove on the next
-    substantial edit of this module if still unused.
-    """
-    scene_s = _scene_scale(config)
-    footprint_range = _scaled(TOPPLE_FOOTPRINT_RANGE, scene_s)
-    height_range = _scaled(TOPPLE_HEIGHT_RANGE, scene_s)
-    xy_range = _scaled(TOPPLE_XY_RANGE, scene_s)
-
-    n = int(rng.integers(BALANCE_N_RANGE[0], BALANCE_N_RANGE[1] + 1))
-    # Composites balance too: their invisible density split (W5) moves the true
-    # threshold exactly like the W2 authored offset. Forced to cuboid (flat base).
-    composite_flags = [bool(rng.uniform() < config.composite_frac) for _ in range(n)]
-    shapes = [
-        "cuboid" if composite_flags[i] else rng.choice(TOPPLE_SHAPES).item()
-        for i in range(n)
-    ]
-    dims_list = [_sample_tall_dims(rng, sh, footprint_range, height_range) for sh in shapes]
-    radii = [_topple_spacing_radius(shapes[i], dims_list[i]) for i in range(n)]
-
-    centers = _place_topple_centers(rng, radii, config, xy_range)
-    while centers is None and n > 1:
-        n -= 1
-        shapes, dims_list, radii = shapes[:n], dims_list[:n], radii[:n]
-        composite_flags = composite_flags[:n]
-        centers = _place_topple_centers(rng, radii, config, xy_range)
-    if centers is None:
-        raise _placement_failed("balance", n, config)
-
-    bodies, body_specs = [], []
-    initial_velocities = []
-    lean_degs, tip_azimuths, theta_crits = [], [], []
-    for i in range(n):
-        pos, quat, ang_vel, lean_deg, tip_az, theta_crit = _topple_lean_pose(
-            rng, shapes[i], dims_list[i], centers[i],
-            lean_band_deg=BALANCE_LEAN_BAND_DEG,
-            kick_range=BALANCE_KICK_ANGVEL_RANGE,
-        )
-        body, spec = body_factory.spawn_dynamic_body(
-            world, rng, config, i, shapes[i], dims_list[i], pos,
-            orientation=quat, composite=composite_flags[i],
-        )
-        bodies.append(body)
-        body_specs.append(spec)
-        initial_velocities.append((_zero_linear_velocity(), ang_vel))
-        lean_degs.append(lean_deg)
-        tip_azimuths.append(tip_az)
-        theta_crits.append(theta_crit)
-
-    scene_specs = {
-        "static_assets": [],
-        "scenario_specs": {
-            # lean − theta_crit is the geometric margin; the SIGN of the true
-            # margin (with the CoM folded in) is what the clip reveals.
-            "lean_band_deg": list(BALANCE_LEAN_BAND_DEG),
-            "kick_angvel_range": list(BALANCE_KICK_ANGVEL_RANGE),
-            "lean_deg": lean_degs,
-            "theta_crit_geom_deg": theta_crits,
-            "tip_azimuth_rad": tip_azimuths,
-        },
-    }
-    return bodies, body_specs, scene_specs, initial_velocities
-
-
-# --- eccentric_roll -----------------------------------------------------------
-# W6 CoM-observability-first scenario, continuous variant (physics-
-# diversification.md W6). Rolling couples the offset to macroscopic motion for
-# the WHOLE clip, not one transient: an offset-CoM cylinder/sphere rolls like
-# an eccentric wheel — speed oscillates at the rotation frequency, spheres
-# curve — and settles CoM-low, so the rest orientation reads out the offset
-# direction in the body frame. Primitives only (composites are cuboids and
-# don't roll); the offset is authored invisibly by spawn_body (R8: one uniform
-# material, no appearance cue).
-
-# Tunables: config.ECCROLL_*
-
-
-def _eccroll_body(rng, s):
-    """Sample (shape, dims, orientation_wxyz, roll_dir, spawn_z) for one roller.
-
-    Cylinders are laid on their side: the local +Z axis is rotated to a random
-    horizontal azimuth ψ (90° about the horizontal axis ⟂ ψ), and the roll
-    direction is ⟂ the cylinder axis. Spheres take a random orientation (so the
-    authored CoM direction is uniformly distributed in the world) and a random
-    roll direction.
-    """
-    shape = rng.choice(ECCROLL_SHAPES).item()
-    r = float(rng.uniform(*_scaled(ECCROLL_RADIUS_RANGE, s)))
-    if shape == "cylinder":
-        h = float(rng.uniform(*_scaled(ECCROLL_LENGTH_RANGE, s)))
-        dims = (r, h)
-        psi = float(rng.uniform(0.0, 2.0 * np.pi))
-        u = np.array([-np.sin(psi), np.cos(psi), 0.0])   # rotation axis ⟂ ψ
-        quat = np.array([np.cos(np.pi / 4.0),            # 90° about u → axis horizontal
-                         np.sin(np.pi / 4.0) * u[0],
-                         np.sin(np.pi / 4.0) * u[1],
-                         np.sin(np.pi / 4.0) * u[2]])
-        sign = float(rng.choice([-1.0, 1.0]))
-        roll_dir = sign * np.array([-np.sin(psi), np.cos(psi), 0.0])
-    else:                                                # sphere
-        dims = (r,)
-        ax = rng.normal(size=3)
-        ax /= np.linalg.norm(ax)
-        ang = float(rng.uniform(0.0, 2.0 * np.pi))
-        quat = np.array([np.cos(ang / 2.0), *(np.sin(ang / 2.0) * ax)])
-        az = float(rng.uniform(0.0, 2.0 * np.pi))
-        roll_dir = np.array([np.cos(az), np.sin(az), 0.0])
-    return shape, dims, quat, roll_dir, r + ECCROLL_GROUND_CLEARANCE
-
-
-def build_eccentric_roll(world, rng, config):
-    """1-3 offset-CoM cylinders/spheres rolling on flat ground; the wobble is the label (W6).
-
-    DEPRECATED (2026-07-27): the only R6-certified CoM scenario (+0.020), retired
-    with the CoM target. Also the weakest fit for the replacement targets: PhysX
-    rolling here is lossless, and a rolling contact carries NO friction-magnitude
-    information — the same mechanism that flipped the sign of the μ estimator
-    (material_oracle._slide_stats). Never in `config.scenarios`. Kept callable per
-    CLAUDE.md §Retire-don't-delete.
-    """
-    s = _scene_scale(config)
-    xy_range = _scaled(ECCROLL_XY_RANGE, s)
-
-    n = int(rng.integers(ECCROLL_N_RANGE[0], ECCROLL_N_RANGE[1] + 1))
-    sampled = [_eccroll_body(rng, s) for _ in range(n)]
-    # Spacing radius: lying cylinder sweeps ~half its length; sphere its radius.
-    radii = [max(dims) * (0.5 if shape == "cylinder" else 1.0) + 0.02
-             for shape, dims, _, _, _ in sampled]
-
-    centers = _place_topple_centers(rng, radii, config, xy_range)
-    while centers is None and n > 1:
-        n -= 1
-        sampled, radii = sampled[:n], radii[:n]
-        centers = _place_topple_centers(rng, radii, config, xy_range)
-    if centers is None:
-        raise _placement_failed("eccentric_roll", n, config)
-
-    bodies, body_specs = [], []
-    initial_velocities = []
-    speeds, azimuths = [], []
-    for i, (shape, dims, quat, roll_dir, z0) in enumerate(sampled):
-        pos = np.array([centers[i][0], centers[i][1], z0])
-        # Primitives only: composite=False by construction (rolling needs a
-        # curved surface; the offset comes from the W2 authored CoM).
-        body, spec = body_factory.spawn_dynamic_body(
-            world, rng, config, i, shape, dims, pos,
-            orientation=quat, composite=False,
-        )
-        bodies.append(body)
-        body_specs.append(spec)
-        speed = float(rng.uniform(*ECCROLL_SPEED_RANGE))
-        r = dims[0]
-        # Rolling-without-slipping start: ω = (v/r)·(d̂ × ẑ) gives v = ω × r_c
-        # for the ground contact at −r·ẑ — no initial skid transient to mask
-        # the eccentric wobble.
-        omega = (speed / r) * np.cross(roll_dir, np.array([0.0, 0.0, 1.0]))
-        initial_velocities.append((speed * roll_dir, omega))
-        speeds.append(speed)
-        azimuths.append(float(np.arctan2(roll_dir[1], roll_dir[0])))
-
-    scene_specs = {
-        "static_assets": [],
-        "scenario_specs": {
-            "speed_range": list(ECCROLL_SPEED_RANGE),
-            "speeds": speeds,
-            "roll_azimuth_rad": azimuths,
-        },
-    }
-    return bodies, body_specs, scene_specs, initial_velocities
-
-
-# --- collide ----------------------------------------------------------------
-# Observability scenario (physics-diversification.md W3). Two bodies on a
-# shared horizontal axis are aimed at each other so they impact near the
-# origin. Momentum exchange makes the *mass ratio* observable — the only way
-# mass (now decoupled from volume by W1) becomes a learnable target rather than
-# a relabelling of visible size.
-
-# Tunables: config.COLLIDE_*
 
 
 def _rot_z(vec, ang):
@@ -924,7 +730,13 @@ def build_collide(world, rng, config):
         "cuboid" if composite_flags[i] else rng.choice(config.shape_choices).item()
         for i in range(2)
     ]
-    dims_list = [body_factory.sample_shape_dims(rng, sh, config.scale_range) for sh in shapes]
+    # Lever 3 (2026-07-28): collide bodies are sampled from their OWN, larger
+    # scale range. Coverage goes as (size/distance)², so upsizing buys the
+    # min_body_coverage margin without pulling the camera in — which would
+    # shrink the framable volume and re-create the problem. Env scenes still get
+    # the env upscale via _scene_scale, so the relative treatment is unchanged.
+    collide_scale = _scaled(COLLIDE_SCALE_RANGE, s)
+    dims_list = [body_factory.sample_shape_dims(rng, sh, collide_scale) for sh in shapes]
 
     # Body 0 at +half_sep along u (moving -u), body 1 at -half_sep (moving +u).
     positions = [half_sep * u + np.array([0.0, 0.0, z0]),
@@ -953,6 +765,7 @@ def build_collide(world, rng, config):
             "half_separation": half_sep,
             "spawn_height": z0,
             "speed_range": list(COLLIDE_SPEED_RANGE),
+            "scale_range": list(COLLIDE_SCALE_RANGE),
             "aim_jitter_deg": COLLIDE_AIM_JITTER_DEG,
         },
     }
@@ -971,9 +784,23 @@ BUILDERS = {
     "cluttered": build_cluttered,
     "topple": build_topple,
     "collide": build_collide,
-    "balance": build_balance,
-    "eccentric_roll": build_eccentric_roll,
 }
+
+# Camera-framing policy per scenario, consumed by
+# `collect_clip.preroll_trajectory` (see its docstring). Default "max_spread"
+# frames everything for the whole clip; "event" frames the moment of closest
+# approach and lets the bodies leave frame afterwards.
+#
+# `collide` is "event" because its payload is the momentum exchange at impact —
+# brief, early, and near the origin. Framing its max-spread frame instead was
+# what dropped 5/6 rollouts as "no viewable camera" (2026-07-28): the framing
+# solve clamps at 4 m, capping the framable cloud at 0.93 m radius, and collide
+# spread well past that. Any future scenario whose payload is a brief event
+# belongs here too.
+GATE_FRAME_POLICY = {
+    "collide": "event",
+}
+
 
 # Coarse expected-observability hint per scenario (physics-diversification.md
 # W3). Consumed later by the observability-weighted loss (R6) and dataset
@@ -992,8 +819,6 @@ OBSERVABILITY_HINT = {
     "cluttered": "contact",
     "topple": "contact",
     "collide": "collision",
-    "balance": "contact",
-    "eccentric_roll": "contact",
 }
 
 

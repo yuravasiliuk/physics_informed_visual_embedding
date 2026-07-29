@@ -56,6 +56,8 @@ carb.settings.get_settings().set(
 
 import argparse
 import dataclasses
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -68,24 +70,17 @@ from omni.isaac.core.utils.stage import create_new_stage
 import body_factory
 import environments
 import lighting
+import cli
 import scenarios
-from camera_paths import FAMILIES, sample_camera_path        # pure numpy, no omni
+from camera_rig import CameraRig                             # owns poses, paths, gating, per-frame logging
 from contact_log import to_camera_frame                      # pure helper
 from clip_capture import (
     body_seg_coverage,
     build_metadata,
     capture,
-    log_camera_frame,
     log_state_frame,
-    make_rig_annotators,
-    probe_body_coverage,
     read_local_com,
-    rig_angle_centers,
-    rotmat_to_quat_wxyz,
-    sample_camera_pose,
     save_clip,
-    set_camera_pose,
-    world_to_camera_frame,
 )
 from config import ClipConfig, DEFAULT_DATA_PATH
 
@@ -112,40 +107,10 @@ def parse_args():
              "N==1 writes directly to --result (legacy layout). Per-clip seed = "
              "--seed + i.",
     )
-    p.add_argument(
-        "--n_cameras", type=int, default=None,
-        help="Override ClipConfig.n_cameras — cameras fanned out per rollout. "
-             "Set 1 to convert render budget into INDEPENDENT rollout groups "
-             "(probe-corpus-spec.md: the probe splits on rollouts, not cameras).",
-    )
-    p.add_argument(
-        "--depth_format", type=str, default=None,
-        choices=["npz", "ffv1", "hevc12"],
-        help="Override ClipConfig.depth_format — depth storage backend "
-             "(depth_map_factory.py). npz=legacy uint16 (bit-exact); ffv1=lossless "
-             "16-bit video; hevc12=lossy 12-bit video (smallest). Experiment knob.",
-    )
-    p.add_argument(
-        "--com_offset_abs", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
-        help="Override ClipConfig.com_offset_abs_range (metres): sample primitive "
-             "CoM offset as an absolute magnitude independent of body size, "
-             "breaking |CoM|~size (probe-corpus-spec.md). Omitted = legacy "
-             "fraction-of-extent behaviour.",
-    )
-    p.add_argument(
-        "--frame_count", type=int, default=None,
-        help="Override ClipConfig.frame_count (rendered frames per clip). W6 "
-             "eccentric_roll uses 128 so the terminal CoM-low oscillation gets "
-             "several cycles on film (physics-diversification.md §W6).",
-    )
-    p.add_argument(
-        "--com_offset_frac", type=float, default=None,
-        help="Override ClipConfig.com_offset_frac (max CoM offset as a fraction "
-             "of each half-extent). W6 balance mid-batch raises it to ~0.45 so "
-             "the offset's angular authority (~±5°) spans the lean band and "
-             "DECIDES most outcomes (pilot #2: mechanism confirmed but "
-             "underpowered at 0.3 — physics-diversification.md §W6).",
-    )
+    # Every ClipConfig override lives in cli.py, shared with collect_corpus so
+    # the two drivers cannot drift. No `defaults=`: an omitted flag leaves the
+    # ClipConfig value alone, keeping ClipConfig the single source of truth.
+    cli.add_config_args(p)
     return p.parse_args()
 
 
@@ -217,17 +182,32 @@ def _teleport_bodies(bodies, snapshot):
         body.set_angular_velocity(np.zeros(3))
 
 
-def preroll_trajectory(world, bodies, initial_velocities, body_specs, config):
+def preroll_trajectory(world, bodies, initial_velocities, body_specs, config,
+                       gate_policy="max_spread"):
     """Deterministic physics-only pre-roll (no rendering) to learn where the
     bodies go, so the rig can frame + gate on the action (camera-framing-fix.md
     §5, Stage 1).
 
     Steps `config.frame_count` physics frames exactly as `simulate_clip` will,
-    recording each body's world pose. Returns:
-        centroid     : (3,) swept-AABB center of all body positions over time
-        cloud_radius : float — farthest body *surface* point from centroid
-        snapshot     : list of (pos, quat) at the frame whose body cloud is most
-                       spread out (the worst case for occlusion → probe pose)
+    recording each body's world pose. Returns `(centroid, cloud_radius,
+    snapshot)`, computed under `gate_policy`:
+
+    **"max_spread"** (default, unchanged): frame EVERYTHING for the WHOLE clip —
+    swept-AABB centroid, `cloud_radius` = farthest body surface point over all
+    frames, snapshot at `spread.argmax()` (worst case for occlusion). Right when
+    the payload is spread over the clip, as in `drop`/`settle`/`topple`.
+
+    **"event"**: frame the MOMENT, and let debris leave afterwards. `f_star` is
+    the frame of MINIMUM spread — closest approach, i.e. the impact — and both
+    centroid and radius are measured AT that frame instead of swept.
+
+    Why the policy exists (2026-07-28): `collide`'s payload is the momentum
+    exchange, which happens early and near the origin, but "max_spread" framed
+    the instant the bodies were furthest apart — the single worst choice for it.
+    With `framing_distance` clamped at 4 m the largest framable cloud is 0.93 m
+    while collide spread past 1.6 m, so 5/6 rollouts were dropped for "no
+    viewable camera". That is a policy mismatch, not bad luck, and it will bite
+    any future scenario whose payload is a brief event.
 
     The bodies are left wherever the pre-roll ends; the caller must re-pose or
     rely on the `world.reset()` at the top of `simulate_clip` to rewind.
@@ -254,121 +234,66 @@ def preroll_trajectory(world, bodies, initial_velocities, body_specs, config):
 
     P = np.stack(poses)   # (F, B, 3)
     Q = np.stack(quats)   # (F, B, 4)
-    pts = P.reshape(-1, 3)
-    centroid = 0.5 * (pts.min(axis=0) + pts.max(axis=0))
-    dist = np.linalg.norm(P - centroid, axis=2) + bound[None, :]   # (F, B)
-    cloud_radius = float(dist.max())
     spread = np.linalg.norm(P.max(axis=1) - P.min(axis=1), axis=1)  # (F,)
-    f_star = int(spread.argmax())
+
+    if gate_policy == "event":
+        # Closest approach = the impact. Measure the cloud AT that frame, not
+        # swept: a swept radius would still push the camera out to the clamp and
+        # reproduce the very problem this policy exists to fix.
+        f_star = int(spread.argmin())
+        pts = P[f_star]
+        centroid = 0.5 * (pts.min(axis=0) + pts.max(axis=0))
+        cloud_radius = float((np.linalg.norm(pts - centroid, axis=1) + bound).max())
+    elif gate_policy == "max_spread":
+        pts = P.reshape(-1, 3)
+        centroid = 0.5 * (pts.min(axis=0) + pts.max(axis=0))
+        dist = np.linalg.norm(P - centroid, axis=2) + bound[None, :]   # (F, B)
+        cloud_radius = float(dist.max())
+        f_star = int(spread.argmax())
+    else:
+        raise ValueError(f"unknown gate_policy {gate_policy!r}; "
+                         "expected 'max_spread' or 'event'")
+
     snapshot = list(zip(P[f_star], Q[f_star]))
     return centroid, cloud_radius, snapshot
 
 
-def gate_camera_rig(bodies, rng, config, centroid, cloud_radius, snapshot):
-    """Propose an evenly-spaced rig anchored on the body cloud, then render-probe
-    each camera and resample/drop until it actually sees the bodies (Stage 2).
+# RELOCATED 2026-07-28 -> camera_rig.CameraRig: `gate_camera_rig`,
+# `build_camera_paths` and `gate_camera_paths` lived here. They were three
+# stages of one job (propose -> gate -> path -> gate) split across a module that
+# also owns scene building and the capture loop, and their outputs had to be
+# threaded to `simulate_clip` as two parallel lists it then duck-typed. The rig
+# owns them now; RNG draw order is preserved exactly (poses for every camera,
+# THEN paths for every camera), so the corpus for a given seed is unchanged.
 
-    Bodies are teleported to the max-spread snapshot before every probe. Returns
-    the accepted list of (camera_pos_world, look_at_world) — length ≤ n_cameras
-    (a viewpoint that stays below `min_body_coverage` after
-    `camera_resample_attempts` is dropped; quality > count).
+
+@dataclasses.dataclass
+class RolloutResult:
+    """Everything one rollout produced, in ONE shape regardless of flags.
+
+    `simulate_clip` used to return 2, 3 or 4 values depending on
+    `collect_raw_pose` and whether the rig was dynamic, so every caller had to
+    know which arm it was on and unpack accordingly. Worse, the arms were
+    mutually exclusive: `collect_raw_pose` took priority and silently discarded
+    the camera records, which is why `verify_physics_labels.case_moving_camera`
+    had to rebuild them by hand. Optional products are now optional FIELDS.
+
+    Every list is per-camera (index c), length = number of surviving cameras.
+    `camera_records[c]` is [] for a static rig — the zero case, not a None.
     """
-    az0 = rng.uniform(0.0, 2.0 * np.pi)
-    centers = rig_angle_centers(config, az0)
-    rig = []
-    probe_idx = 0
-    for az_c, el_c in centers:
-        for _attempt in range(config.camera_resample_attempts + 1):
-            _teleport_bodies(bodies, snapshot)
-            pos, look = sample_camera_pose(rng, config, centroid, cloud_radius, az_c, el_c)
-            cov = probe_body_coverage(pos, look, config.resolution, probe_idx=probe_idx)
-            probe_idx += 1
-            if cov >= config.min_body_coverage:
-                rig.append((pos, look))
-                break
-    return rig
+    frames: list
+    state_records: list
+    camera_records: list
+    raw_pose_world: list = None
+    raw_quat_world: list = None
+
+    def __iter__(self):
+        # Back-compat for `frames, records = simulate_clip(...)`: the two
+        # always-present products unpack exactly as before.
+        return iter((self.frames, self.state_records))
 
 
-def build_camera_paths(rig, rng, config, centroid, cloud_radius):
-    """One CameraPath per gated rig camera (dynamic-camera.md §3).
-
-    The family mix comes from `config.camera_path_families` /
-    `camera_path_weights`; `static` is the zero-coefficient case, so a
-    static-only config reproduces today's corpus exactly. `camera_roll_always`
-    forces a roll component onto whatever family is drawn — needed because
-    **only roll breaks the g_cam.x ≡ 0 degeneracy**: orbit is pure yaw about the
-    gravity axis and dolly is pure translation, and BOTH leave gravity tilt
-    exactly invariant (measured + gated in verify_camera_paths.py). A dynamic
-    mix without roll is just as degenerate as a static rig.
-
-    The t=0 pose equals the gated rig pose, so visibility gating stays valid at
-    the first frame by construction; `gate_camera_rig` re-probes along the path.
-    """
-    families = tuple(getattr(config, "camera_path_families", ("static",)))
-    weights = getattr(config, "camera_path_weights", None)
-    if weights is not None:
-        w = np.asarray(weights, dtype=np.float64)
-        w = w / w.sum()
-    else:
-        w = None
-    paths = []
-    for cam_pos, look_at in rig:
-        kind = str(rng.choice(families, p=w))
-        offset = np.asarray(cam_pos, dtype=np.float64) - np.asarray(look_at, dtype=np.float64)
-        d = float(np.linalg.norm(offset))
-        az = float(np.arctan2(offset[1], offset[0]))
-        el_deg = float(np.degrees(np.arcsin(np.clip(offset[2] / max(d, 1e-9), -1.0, 1.0))))
-        paths.append(sample_camera_path(
-            rng, kind, az, el_deg, d, look_at, config.render_dt,
-            el_clamp_deg=config.camera_elevation_clamp_deg,
-            d_clamp=config.camera_radius_clamp,
-            roll_always=bool(getattr(config, "camera_roll_always", False)),
-        ))
-    return paths
-
-
-def gate_camera_paths(rig, cam_paths, config, snapshot_probe_start=1000):
-    """Drop cameras whose PATH leaves the action, not just whose t=0 pose does.
-
-    `gate_camera_rig` probes a single pose; a moving camera can start framed and
-    drift into a wall, the floor, or empty space. This re-probes
-    `config.camera_path_gate_samples` poses spread over the clip and drops the
-    camera if ANY of them falls below `min_body_coverage` — quality > count, the
-    same philosophy as the static gate (camera-framing-fix.md §5).
-
-    Static paths are skipped entirely: every pose is identical, so the t=0 gate
-    already settled it and re-probing would just burn render products.
-
-    Returns (rig, cam_paths) filtered in lockstep. NOTE the probe uses the
-    pre-roll snapshot state, so it measures framing of where the bodies GO, not
-    where they start — same limitation/benefit as the static gate.
-    """
-    n = int(getattr(config, "camera_path_gate_samples", 4))
-    if n <= 1:
-        return rig, cam_paths
-    keep_rig, keep_paths, probe_idx = [], [], snapshot_probe_start
-    for (pos0, look0), path in zip(rig, cam_paths):
-        if path.is_static():
-            keep_rig.append((pos0, look0))
-            keep_paths.append(path)
-            continue
-        # t=0 already passed the static gate; sample the REST of the clip.
-        ts = np.linspace(0, config.frame_count - 1, n + 1)[1:].astype(int)
-        ok = True
-        for t in ts:
-            pos, look, _ = path.pose(int(t))
-            cov = probe_body_coverage(pos, look, config.resolution, probe_idx=probe_idx)
-            probe_idx += 1
-            if cov < config.min_body_coverage:
-                ok = False
-                break
-        if ok:
-            keep_rig.append((pos0, look0))
-            keep_paths.append(path)
-    return keep_rig, keep_paths
-
-
-def simulate_clip(world, bodies, initial_velocities, cam_annots, config, cam_extrinsics,
+def simulate_clip(world, bodies, initial_velocities, rig, config,
                   collect_raw_pose=False, contact_logger=None):
     """Run the K-frame loop once, capturing from N cameras simultaneously.
 
@@ -402,7 +327,7 @@ def simulate_clip(world, bodies, initial_velocities, cam_annots, config, cam_ext
     # so cache the local CoM offset once instead of re-reading USD per frame.
     local_coms = [read_local_com(body) for body in bodies]
 
-    C = len(cam_annots)
+    C = len(rig)
     cam_frames = [[] for _ in range(C)]
     cam_records = [[] for _ in range(C)]
     raw_pose_world = [[] for _ in bodies] if collect_raw_pose else None
@@ -410,18 +335,26 @@ def simulate_clip(world, bodies, initial_velocities, cam_annots, config, cam_ext
     # Dynamic-camera support (dynamic-camera.md §6): `cam_extrinsics[c]` may be
     # either the legacy constant (R, pos, q) tuple OR a CameraPath. Duck-typed
     # on `.extrinsics` so the static path is untouched — additive by design,
-    # the same pattern collect_pairs uses.
-    cam_paths = [e if hasattr(e, "extrinsics") else None for e in cam_extrinsics]
-    cam_track = [[] for _ in range(C)] if any(p is not None for p in cam_paths) else None
-
+    # the same pattern the (now retired) collect_pairs driver used.
+    # Progress every 16 frames. A dynamic rig re-poses C camera prims through
+    # Replicator per frame on top of the render, so this loop is materially
+    # slower than the static one and used to run silently for minutes.
+    t_loop = t_mark = time.time()
     for frame_idx in range(config.frame_count):
+        if frame_idx and frame_idx % 16 == 0:
+            # stdout: Kit relabels stderr as [Error] (see camera_rig._progress).
+            # Marginal s/frame, not cumulative — cumulative hides a per-frame
+            # cost that GROWS with frame index, which is exactly what a
+            # Replicator graph accumulating one node per pose write looks like.
+            print(f"  [clip] frame {frame_idx}/{config.frame_count} "
+                  f"x{C} cam | {time.time() - t_loop:.0f}s total | "
+                  f"{(time.time() - t_mark) / 16:.2f}s/frame last 16",
+                  file=sys.stdout, flush=True)
+            t_mark = time.time()
         # Re-pose every moving camera BEFORE stepping, so frame t is rendered
-        # from pose t. An explicit rotation (not look_at) is mandatory or roll
-        # is silently dropped — see clip_capture.set_camera_pose.
-        for c, path in enumerate(cam_paths):
-            if path is not None:
-                R_cw_t, pos_t = path.extrinsics(frame_idx)
-                set_camera_pose(cam_annots[c], pos_t, R_cw_t)
+        # from pose t. No-op for a static rig, so there is ONE loop body here
+        # rather than a static branch and a dynamic branch.
+        rig.pose_for_frame(frame_idx)
 
         # Tag contact events with the rendered frame they fall in. Several
         # physics substeps happen inside one rendered frame, and the events
@@ -432,16 +365,12 @@ def simulate_clip(world, bodies, initial_velocities, cam_annots, config, cam_ext
         world.step(render=True)
         rep.orchestrator.step()  # flush all render products for this frame
         for c in range(C):
-            cam_frames[c].append(capture(cam_annots[c]))
-            if cam_paths[c] is None:
-                R_camera_world, camera_pos_world, q_camera_world = cam_extrinsics[c]
-            else:
-                # Frame-t extrinsics — the SAME values used to pose the prim
-                # above, so pixels and labels cannot describe different cameras.
-                R_camera_world, camera_pos_world = cam_paths[c].extrinsics(frame_idx)
-                q_camera_world = rotmat_to_quat_wxyz(R_camera_world)
-                log_camera_frame(cam_paths[c], frame_idx, cam_track[c],
-                                 R_camera_world, camera_pos_world)
+            cam_frames[c].append(capture(rig.annotators(c)))
+            # Frame-t extrinsics — the SAME values used to pose the prim above,
+            # so pixels and labels cannot describe different cameras. Constant
+            # for a static rig, which is why no branch is needed.
+            R_camera_world, camera_pos_world, q_camera_world = rig.extrinsics(c, frame_idx)
+            rig.log_frame(c, frame_idx, R_camera_world, camera_pos_world)
             log_state_frame(
                 bodies, local_coms, frame_idx, cam_records[c],
                 R_camera_world=R_camera_world,
@@ -454,11 +383,13 @@ def simulate_clip(world, bodies, initial_velocities, cam_annots, config, cam_ext
                 raw_pose_world[b_i].append(np.asarray(p, dtype=np.float64))
                 raw_quat_world[b_i].append(np.asarray(q, dtype=np.float64))
 
-    if collect_raw_pose:
-        return cam_frames, cam_records, raw_pose_world, raw_quat_world
-    if cam_track is not None:
-        return cam_frames, cam_records, cam_track
-    return cam_frames, cam_records
+    return RolloutResult(
+        frames=cam_frames,
+        state_records=cam_records,
+        camera_records=rig.all_camera_records(),
+        raw_pose_world=raw_pose_world,
+        raw_quat_world=raw_quat_world,
+    )
 
 
 def make_contact_logger(bodies, config):
@@ -579,52 +510,30 @@ def collect_clip(base_out, start_idx, config: ClipConfig, seed: int, env_overrid
     # viewpoints occluded by env geometry or pointed at a wall/void.
     centroid, cloud_radius, snapshot = preroll_trajectory(
         world, bodies, initial_velocities, body_specs, config,
+        gate_policy=scenarios.GATE_FRAME_POLICY.get(scenario_name, "max_spread"),
     )
-    rig = gate_camera_rig(bodies, rng, config, centroid, cloud_radius, snapshot)
-    if not rig:
-        # Nothing viewable from any proposed viewpoint after resampling — emit no
-        # clips rather than save garbage (quality > count).
-        return []
     # Camera paths (dynamic-camera.md §3-§4). RNG DISCIPLINE: these draws happen
     # AFTER every physics-affecting sampler (scene build + pre-roll are done
     # above), so switching camera family leaves the rollout bit-identical — the
     # precondition for egomotion twins. `static` consumes no draws at all and
     # reproduces the legacy behaviour exactly.
-    #
-    # ORDER MATTERS: paths are gated BEFORE annotators are created, because
-    # path gating can drop a camera and the annotator list must stay parallel
-    # to `rig`.
-    cam_paths = build_camera_paths(rig, rng, config, centroid, cloud_radius)
-    rig, cam_paths = gate_camera_paths(rig, cam_paths, config)
-    if not rig:
-        # Every viewpoint drifts off the action somewhere in the clip.
+    rig = CameraRig.solve(rng, config, centroid, cloud_radius,
+                          teleport=lambda: _teleport_bodies(bodies, snapshot))
+    if rig.is_empty():
+        # Nothing viewable from any proposed viewpoint, or every viewpoint drifts
+        # off the action somewhere in the clip — emit no clips rather than save
+        # garbage (quality > count).
         return []
-    cam_annots = make_rig_annotators(rig, config.resolution)
-    cam_extrinsics = []
-    for path in cam_paths:
-        R_cw, cam_pos_w = path.extrinsics(0)
-        cam_extrinsics.append((R_cw, cam_pos_w, rotmat_to_quat_wxyz(R_cw)))
 
-    any_dynamic = any(not p.is_static() for p in cam_paths)
-    # Contact reporting must be applied to the prims BEFORE the reset inside
-    # simulate_clip, or PhysX materializes the bodies without the report API.
     contact_logger = make_contact_logger(bodies, config)
-    sim_out = simulate_clip(
-        world, bodies, initial_velocities, cam_annots, config,
-        cam_paths if any_dynamic else cam_extrinsics,
-        contact_logger=contact_logger,
-    )
+    rollout = simulate_clip(world, bodies, initial_velocities, rig, config,
+                            contact_logger=contact_logger)
+    cam_frames, cam_records = rollout.frames, rollout.state_records
     contact_events = []
     if contact_logger is not None:
         contact_events = contact_logger.drain()
         contact_logger.close()
         print(f"  contacts: {len(contact_events)} events", flush=True)
-    if any_dynamic:
-        cam_frames, cam_records, cam_track = sim_out
-    else:
-        cam_frames, cam_records = sim_out
-        cam_track = None
-
     # Post-reset MEASURED mass properties — the training-truth labels, camera-
     # agnostic. PhysX only materializes mass/CoM at world.reset() (done inside
     # simulate_clip) and both are constant thereafter, so read them back now. The
@@ -641,7 +550,7 @@ def collect_clip(base_out, start_idx, config: ClipConfig, seed: int, env_overrid
     C = len(rig)
     for c in range(C):
         out_dir = os.path.join(base_out, f"clip_{start_idx + c:05d}")
-        R_cw, cam_pos_w, _ = cam_extrinsics[c]
+        R_cw, cam_pos_w, _ = rig.extrinsics(c, 0)
         specs_c = [dict(s) for s in body_specs]
         for spec, (lin_vel_world, ang_vel_world) in zip(specs_c, initial_velocities):
             lin_vel_world = np.asarray(lin_vel_world, dtype=np.float64)
@@ -654,27 +563,29 @@ def collect_clip(base_out, start_idx, config: ClipConfig, seed: int, env_overrid
         ok, reason = validate_clip(cam_frames[c], cam_records[c], config)
         meta = build_metadata(
             config, specs_c, scene_specs, scenario_name, R_cw, seed,
-            camera_position_world=[float(x) for x in rig[c][0]],
-            camera_look_at_world=[float(x) for x in rig[c][1]],
+            camera_position_world=[float(x) for x in rig.poses[c][0]],
+            camera_look_at_world=[float(x) for x in rig.poses[c][1]],
             multiview={"rollout_seed": seed, "camera_index": c, "n_cameras": C},
-            camera_path=cam_paths[c],
+            camera_path=rig.path(c),
         )
         meta["validation"] = {"ok": ok, "reason": reason}
         # Contacts are pairwise SCENE facts, so they are logged once in world
         # frame and converted per clip using that camera's extrinsics — the same
         # camera-frame invariant the body records follow. For a moving camera the
         # conversion uses the event's own frame-t extrinsics.
+        # `rig.camera_records(c)` is [] for a static rig (the zero case), so
+        # emptiness — not None — marks "no per-frame extrinsics".
         contacts_c = None
         if contact_events:
-            if cam_track is not None:
+            if rig.is_dynamic():
                 contacts_c = []
                 for ev in contact_events:
-                    R_t, p_t = cam_paths[c].extrinsics(ev["frame"])
+                    R_t, p_t, _ = rig.extrinsics(c, ev["frame"])
                     contacts_c.extend(to_camera_frame([ev], R_t, p_t))
             else:
                 contacts_c = to_camera_frame(contact_events, R_cw, cam_pos_w)
         save_clip(out_dir, cam_frames[c], cam_records[c], meta,
-                  camera_records=(cam_track[c] if cam_track is not None else None),
+                  camera_records=(rig.camera_records(c) or None),
                   contact_records=contacts_c,
                   save_resolution=config.save_resolution,
                   depth_format=config.depth_format)
@@ -684,23 +595,14 @@ def collect_clip(base_out, start_idx, config: ClipConfig, seed: int, env_overrid
 
 def main():
     args = parse_args()
-    config = ClipConfig()
+    cli.validate_camera_args(args)
+    config = cli.config_from_args(args)
     if args.scenario is not None:
         if args.scenario not in scenarios.BUILDERS:
             raise SystemExit(
                 f"--scenario {args.scenario!r} not in {sorted(scenarios.BUILDERS)}"
             )
         config = dataclasses.replace(config, scenarios=(args.scenario,))
-    if args.n_cameras is not None:
-        config = dataclasses.replace(config, n_cameras=args.n_cameras)
-    if args.com_offset_abs is not None:
-        config = dataclasses.replace(config, com_offset_abs_range=tuple(args.com_offset_abs))
-    if args.depth_format is not None:
-        config = dataclasses.replace(config, depth_format=args.depth_format)
-    if args.frame_count is not None:
-        config = dataclasses.replace(config, frame_count=args.frame_count)
-    if args.com_offset_frac is not None:
-        config = dataclasses.replace(config, com_offset_frac=args.com_offset_frac)
 
     base_out = os.path.abspath(args.result)
     n_ok = 0

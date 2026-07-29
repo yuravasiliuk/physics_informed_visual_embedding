@@ -93,7 +93,7 @@ the named product of the experiment. Routing rules (load-bearing):
 ## 3. Training signals (from the supervision-menu discussion)
 
 ### 3.1 Twin-contrastive (primary; the sim-unique, R8-proof signal)
-[collect_pairs.py](../../src/data_gen/collect_pairs.py) already builds
+The retired [collect_pairs.py](../../src/legacy/collect_pairs.py) already built
 controlled-intervention twins (same seed, frame-0-identical pixels). Its CoM
 intervention mode is **retired with the CoM target**; what survives is the
 mechanism — build once, re-simulate per variant, log GT divergence + fork frame.

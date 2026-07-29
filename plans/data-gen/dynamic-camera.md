@@ -116,12 +116,95 @@ egomotion-dominated and the physics targets get swamped.
   identical path; elevation/radius clamps hold across the whole clip.
 - Gait egomotion magnitudes: ~0.18 m/s, ~0.19 rad/s (sanity band for the §9.4 flow bound).
 
+### 3b. Two camera models, one namespace
+
+§3's parametrization is **subject-anchored**: every pose is (az, el, d) about a
+look-at point, so aim is locked on the subject *by construction*. That cannot
+express pan, tilt, or true lateral travel — the shots a moving observer actually
+makes. So there is a second model,
+[camera_motion.py](../../src/data_gen/camera_motion.py): free 6-DoF in the
+cinematography basis (surge/sway/heave · pan/tilt/roll), integrated once from a
+seeded rng (rotations don't commute, so "drive forward while steering" is an ODE,
+not a closed form). Both classes expose the same
+`pose/extrinsics/gravity_camera/is_static/to_dict` surface, so everything
+downstream is duck-typed and unchanged.
+
+| | subject-anchored (`camera_paths`) | free 6-DoF (`camera_motion`) |
+|---|---|---|
+| Families | `static orbit arc dolly roll handheld gait` | `still dolly_in dolly_out truck pedestal steer handheld gait orbit_free survey` |
+| Aim | locked on the look-at | dead-reckoned, optional partial track (`camera_track_tau`) |
+| Zero case | `static` (all coefficients 0) | `still` (no terms) |
+| Random access | O(1) closed form | precomputed (cache) |
+
+**Name resolution** (`camera_motion.resolve_family`, gated in
+`verify_camera_motion.py`): `handheld` and `gait` exist in **both** and mean
+different motion, so a bare name is a hard error — write `subject:gait` or
+`free:gait`. Every other name resolves bare. Resolution is per rig camera, so one
+clip can mix models; it runs at argument-parse time in `collect_corpus` so a typo
+costs a second, not a rollout.
+
+**`roll_always` differs by model, deliberately.** Subject-anchored: an
+oscillating roll amplitude. Free: a *constant* frame-0 roll offset, and only for
+families that don't already command a roll rate — so it buys between-clip tilt
+spread without fighting a family whose roll dynamics are the point, and without
+burning an rng draw that would break twin bit-reproducibility.
+
+**`camera_track_tau`** (free only) blends re-aiming per frame: 0 = dead reckoning
+(honest egomotion, but the subject exits frame and the along-path gate drops the
+camera — it costs yield), ~0.1–0.3 = operator following loosely, 1 = locked on
+(which collapses the free model back onto subject-anchored behaviour). The blend
+is a **minimal rotation**, so it preserves roll and does not undo `roll_always`.
+
+### 3c. `camera_speed_scale` — one knob for "faster", both models
+
+`ClipConfig.camera_speed_scale` / `--camera_speed_scale` (default `1.0`) scales
+how fast **every** sampled path is traversed, across both camera models. It is
+defined as a **time warp, not a gain**: the path becomes `x(s·t)` — the same
+shot, traversed `s` times faster, so `s=2` gives twice the travel over the same
+`frame_count`.
+
+The distinction is not pedantry, it is the whole design:
+
+- A **gain** (multiply the commanded velocity) would double the *amplitude* of
+  every oscillation, because a `sine` roll term at 2× integrates to twice the
+  roll angle. That is a different shot, not a faster one.
+- A **warp** needs both halves — evaluate the term shapes at warped time *and*
+  multiply by `s`, since `d/dt x(s·t) = s·x'(s·t)`. Amplitudes are preserved,
+  cadences double.
+- Warping is the only operation both models share. The subject-anchored model
+  is a closed form in `t`, so the warp is **exact** (verified to 0.0); the free
+  model integrates body-frame velocities, so it is **first-order in `dt`**
+  (verified: the residual halves with `dt`). A gain would have needed a separate
+  implementation per family and would not be comparable across models.
+
+Implementation notes that matter:
+- Stamped on **after** `sample_motion`, in `sample_free_path` — so no family
+  sampler has to know the knob exists, and **the RNG stream is untouched**. Same
+  seed = same shot at every speed, which is what makes a speed sweep a
+  controlled comparison rather than a fresh corpus.
+- `speed_scale == 0` reports `is_static()` in both models, so a frozen camera
+  takes the static path and skips the along-path gate and per-frame re-posing
+  (§8.1) instead of paying for motion it doesn't have.
+- Round-trips through `to_dict()` in both models — provenance must keep
+  describing the camera the pixels came from.
+
+⚠ **Raising it is not free.** Egomotion-induced image flow scales linearly with
+it, and §9.4 requires that flow *not* dominate object-induced flow — so a speed
+sweep is exactly the experiment that can walk into the acceptance bound. It also
+costs along-path gate yield: a faster camera leaves the framed volume sooner.
+The per-family rate bands (`ORBIT_RATE_DPS` and friends in `camera_paths.py`)
+remain the place to change one family's character; this knob is for moving all
+of them together.
+
 ## 4. Determinism + twin discipline (load-bearing)
 
 - **Camera RNG must come from a separate stream** (or be drawn strictly after every
   physics-affecting draw), so that changing camera parameters leaves dynamics
-  bit-identical. This is the same discipline `collect_pairs` relies on for
-  frame-0-identical twins ([collect_pairs.py](../../src/data_gen/collect_pairs.py) docstring).
+  bit-identical. This is the same discipline the twin machinery relies on for
+  frame-0-identical twins (the retired
+  [collect_pairs.py](../../src/legacy/collect_pairs.py) docstring; its CoM
+  intervention died with the target, but the twin *discipline* is what egomotion
+  twins inherit — same seed, `--camera_families` A vs B, no separate driver).
   Verify by asserting `state.json` world-frame reconstruction is unchanged across
   two runs that differ only in camera path.
 - **Egomotion twins** are then just: same seed, `--camera_path` A vs B.
@@ -182,11 +265,38 @@ configs must declare which slice they consume; group-aware folds unchanged.
 
 ## 6. Code hook points
 
-| Hook | Where | Change |
+**Superseded by `CameraRig` (2026-07-28).** The table below is the *record of what
+had to change*; it is no longer a map of where the code lives. Everything
+camera-side now has one owner,
+[camera_rig.py](../../src/data_gen/camera_rig.py) — propose → gate → path →
+along-path gate → annotators → per-frame pose → per-frame log — because the
+logic was smeared across four modules and `simulate_clip` had to duck-type two
+parallel lists whose elements were *either* a `(R, pos, q)` tuple *or* a path
+object. `collect_clip.py` went 737 → 623 lines and the duck-typing branch count
+in its capture loop is now zero: **static is the zero-coefficient case in code,
+not only in this document.** `camera_paths.py` and `camera_motion.py` are
+unchanged — pure math with 61 passing offline checks; the rig consumes them.
+
+The rig's API is deliberately two tiers, because `extrinsics()` *reads* like a
+trainable pose and is not one:
+- **transform tier** — `extrinsics(c, t) -> (R_camera_world, camera_pos_world,
+  q_camera_world)`, USD stage world frame. **Gauge**: world origin (3 DoF) and
+  yaw about gravity (1 DoF) are exactly the unobservable directions (§10), so
+  translating the scene leaves every label bit-identical. For posing the prim
+  and projecting body state — never a supervision target.
+- **label tier** — `egomotion(c, t)`, `gravity_camera(c, t)`: frame-relative,
+  well-posed, safe to supervise.
+
+`camera.json` still stores the world transform as provenance, since
+window-anchored relative targets are derived from it at target-build time.
+
+| Hook | Where (at the time) | Change |
 |---|---|---|
 | Roll parameter | `world_to_camera_frame` [clip_capture.py:208](../../src/data_gen/clip_capture.py) | add `roll_rad=0.0` (default = today's zero-roll basis); rotate `(right, up)` about `forward`. **Without this there is no roll, moving camera or not.** |
 | Path sampling | new `src/data_gen/camera_paths.py` | families of §3; `t=0` pose must equal today's `sample_camera_pose` for `static` |
+| Model dispatch | `build_camera_paths` [collect_clip.py:292](../../src/data_gen/collect_clip.py) | one call to `camera_motion.sample_any_path`, which resolves the name (§3b) and derives the az/el/d the subject layer needs from the gated rig pose |
 | Per-step camera pose | `make_annotators` / `make_rig_annotators` [clip_capture.py:34/181](../../src/data_gen/clip_capture.py) | retain the camera prim path; set pose each step before `rep.orchestrator.step()` |
+| **Replicator frame adapter** | `replicator_rotation_xyz_deg` [camera_paths.py](../../src/data_gen/camera_paths.py) | `rep.create.camera` builds `Camera_Xform` (posed by `rep.modify.pose`) with a CHILD `Camera` prim holding a fixed `rotateXYZ=(90,0,90)`. USD composes child-then-parent, so what renders is `E_parent @ C`. Posing with the raw matrix renders a **cyclic row permutation** of the intended basis — on screen that is *sideways travel*, not a mis-aimed camera, so it reads as a path bug. Send `C @ R_camera_world` instead |
 | Per-frame extrinsics | `simulate_clip` [collect_clip.py:282](../../src/data_gen/collect_clip.py) | `cam_extrinsics` becomes a per-camera **path object**, evaluated per `frame_idx` |
 | Metadata | `build_metadata` [clip_capture.py:354](../../src/data_gen/clip_capture.py) | schema bump + `camera_path` block |
 | Visibility gating | `gate_camera_rig` / `probe_body_coverage` [collect_clip.py:257](../../src/data_gen/collect_clip.py) | gate on **K sampled poses along the path** (e.g. t ∈ {0, ¼, ½, ¾, 1}), not one pose; drop the camera if any sample fails |
@@ -215,6 +325,15 @@ extrinsics **once** from the config camera. Under a path it must:
 - add the **`g_cam` consistency identity**: `g_cam(t+1) == R_rel(t) @ g_cam(t)` with
   `R_rel(t) = R_cw(t+1) @ R_cw(t).T`, to machine precision.
 
+**DONE 2026-07-28** — implemented as `verify_physics_labels.py --case moving_camera`.
+It goes further than the three bullets above in one respect: rather than requiring
+the bodies to be static, it compares against `get_world_pose` (which no camera
+touches), so the reprojection identity is exact whether the bodies move or not
+and a residual cannot be blamed on physics. Adds a **frame-shifted negative
+control** — the same reprojection through frame `t+1`'s extrinsics must be far
+worse (13.5 mm vs a ~1e-16 pass) — because the check would otherwise pass
+vacuously for a slow camera, which is exactly when an off-by-one hides.
+
 **Labels must pass before any GPU/scale spend** — unchanged rule.
 
 ## 8. Pilot before scale
@@ -222,6 +341,39 @@ extrinsics **once** from the config camera. Under a path it must:
 Same shape as the W6 pilots: ~20 rollouts × {static, orbit+roll, gait}, then
 (a) verify-gate, (b) visual check that the action stays framed, (c) the §9
 acceptance numbers. Scale only what passes.
+
+### 8.1 Cost model — a dynamic batch is NOT a static batch with a flag
+
+Discovered 2026-07-28 when the first dynamic run was reported as hung. It was
+not hung; it was paying costs a static rig never pays, silently. Per rollout,
+with `n_cameras=C` and `frame_count=K`:
+
+| cost | static | dynamic | why |
+|---|---|---|---|
+| t=0 coverage renders | ≤ `C·(camera_resample_attempts+1)` | same | phase 1, unchanged |
+| along-path renders | **0** | `C · camera_path_gate_samples` | `_gate_paths` short-circuits on `is_static()`, so a static rig skips the whole gate |
+| prim re-poses | **0** | `C · K` | `pose_for_frame` → `rep.modify.pose` per camera per frame |
+
+At the defaults (`C=7`, `attempts=8`, `gate_samples=4`, `K=64`) that is up to 63
+t=0 renders **plus 28 along-path renders before frame 0 is captured**, then 448
+Replicator pose writes. `verify_forward_motion` never surfaced this because it
+runs `C=1`.
+
+Consequences, all load-bearing:
+- **Bring up a new dynamic config at `--n_cameras 1`**, which is the regime
+  `verify_forward_motion` already proves, then ramp. Scaling `C` scales *both*
+  new costs linearly.
+- `--camera_path_gate_samples 1` disables the along-path gate outright — the
+  honest way to separate "gate is slow" from "capture is slow".
+- Gating now prints one stderr line per camera and the capture loop one per 16
+  frames (`camera_rig._progress`), so slow is distinguishable from hung. That
+  distinction is the whole reason this section exists.
+
+⚠ Known leak, not yet fixed: `clip_capture.probe_body_coverage` destroys its
+render product but **not** the `rep.create.camera` prim, so every probe leaves an
+orphan camera on the stage — ~90/rollout dynamic vs ~10 static. Suspected
+contributor to superlinear slowdown across rollouts; unmeasured. Fixing it means
+either destroying the prim or reusing ONE probe camera across probes.
 
 ## 9. Acceptance criteria
 

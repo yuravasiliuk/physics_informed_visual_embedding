@@ -87,8 +87,9 @@ def attach_density(prim, density):
 
     PhysX computes mass = density * collision-shape-volume (and the inertia
     tensor) at world.reset(). No explicit mass/inertia attr is set, so density
-    is the sole driver. Paired with attach_center_of_mass (W2), which overrides
-    only the CoM; mass + inertia stay PhysX-computed and scale-correct.
+    is the sole driver — and since the W2 CoM authoring was removed, nothing
+    overrides any mass property: mass, CoM and inertia are all PhysX-computed
+    and scale-correct.
     """
     mass_api = UsdPhysics.MassAPI.Apply(prim)
     mass_api.CreateDensityAttr().Set(float(density))
@@ -97,7 +98,9 @@ def attach_density(prim, density):
 def half_extents(shape, dims):
     """Per-axis half-extent of the collision volume (np.array of 3 floats).
 
-    Used to bound a sampled CoM offset so it stays inside the body. Sphere
+    Used for spawn spacing and body-scale bookkeeping (`scenarios` lean/topple
+    geometry, the cloud-radius solve in `collect_clip`); it used to also bound
+    the sampled W2 CoM offset, which is gone. Sphere
     uses its radius on all three axes; cylinder/capsule use radius on x,y and
     half the cylinder length on z (their local symmetry axis).
     """
@@ -163,23 +166,18 @@ def prim_local_scale(prim):
     return np.array([s[0], s[1], s[2]], dtype=np.float64)
 
 
-def attach_center_of_mass(prim, com_local, prim_scale):
-    """Author an offset CoM via MassAPI, scale-corrected (W2 + W4 fix).
-
-    `com_local` is the intended CoM offset in PHYSICAL body-local metres. USD's
-    MassAPI centerOfMass is interpreted in the prim's UNSCALED local space, so
-    we divide by the prim scale: physical CoM = attr * scale. Without this a
-    scaled prim (a cuboid built with scale=dims) silently shrinks the offset by
-    the scale factor and decouples it from the logged label — the bug the W4
-    verify caught. Mass + inertia are left to PhysX (computed from density +
-    geometry about this CoM); the offset CoM is the only mass property we pin.
-    The authored value is cross-checked post-reset against read_local_com.
-    """
-    mass_api = UsdPhysics.MassAPI.Apply(prim)
-    com_attr = np.asarray(com_local, dtype=np.float64) / np.asarray(prim_scale, dtype=np.float64)
-    mass_api.CreateCenterOfMassAttr().Set(
-        Gf.Vec3f(float(com_attr[0]), float(com_attr[1]), float(com_attr[2]))
-    )
+# REMOVED 2026-07-28: `attach_center_of_mass` (W2 — author an offset CoM on
+# primitives so the CoM-offset label had variance). The CoM target is abandoned
+# (EXPERIMENTS.md Graveyard: not decodable even from GT trajectory features), so
+# primitives now get PhysX's computed CoM — the geometric centroid for a uniform
+# shape. `prim_local_scale` above is kept: it is the general unscaled-local-space
+# reader, and the W4 scale bug it fixed is a trap any future MassAPI authoring
+# would hit again.
+#
+# Composites (W5, `spawn_composite_body`) are UNAFFECTED and keep their offset
+# CoM: theirs *emerges* from a real density distribution PhysX integrates rather
+# than being authored, so it remains a genuine, closed-form-checkable mass
+# property (`com_local_analytic`) and the driver of their rotational dynamics.
 
 
 def zero_damping(prim):
@@ -398,33 +396,20 @@ def spawn_body(world, rng, config, i, shape, dims, position, color=None, orienta
     # W1: decouple mass from visible volume via a per-body density (PhysX
     # resolves mass = density * volume at reset; we log the analytic value,
     # which matches, plus the measured get_mass() post-reset as the label).
-    # W2: author an offset CoM so the CoM-offset label has real variance. The
-    # offset is a per-axis fraction of the half-extent, bounded inside the
-    # collision volume, scale-corrected in attach_center_of_mass, and verified
-    # against read_local_com post-reset. Inertia is left to PhysX. Appearance
-    # gives no cue to the CoM. (physics-diversification.md W1+W2 / #7,#9; R7.)
+    # (physics-diversification.md W1 / #7,#9.)
+    #
+    # W2 (authored offset CoM) was REMOVED 2026-07-28 with the CoM target. A
+    # uniform primitive's CoM is now PhysX's own — the geometric centroid — so
+    # `com_camera` degenerates to the prim origin for primitives and stays a
+    # genuine mass-distribution readout only for composites (W5). Note this also
+    # retires the RNG draws that used to happen here: primitive sampling now
+    # consumes fewer draws, so **clips are not seed-comparable across this
+    # change**. That is fine (the corpus is being rebuilt from scratch) but it
+    # means old seeds do not reproduce old scenes.
     density = float(rng.uniform(*config.density_range))
     volume = shape_volume(shape, dims)
     mass = density * volume
-    he = half_extents(shape, dims)
-    if config.com_offset_abs_range is None:
-        # Legacy (W2): offset = U(±frac)·half_extent — magnitude scales with body
-        # size, which makes |CoM| ∝ size (coverage audit: |CoM|~bbox +0.62 cache /
-        # +0.34 meta). Kept as default for backward-compatibility.
-        com_local = rng.uniform(-config.com_offset_frac, config.com_offset_frac,
-                                size=3) * he
-    else:
-        # Decorrelated (probe-corpus-spec.md): sample an ABSOLUTE offset magnitude
-        # in metres independent of size, in a random direction, then clamp per axis
-        # to com_offset_frac·half_extent so the CoM stays well inside the collision
-        # hull. Breaks |CoM|~size so a probe cannot decode CoM via silhouette (R8).
-        mag = float(rng.uniform(*config.com_offset_abs_range))
-        d = rng.normal(size=3)
-        d /= (np.linalg.norm(d) + 1e-12)
-        com_local = np.clip(mag * d, -config.com_offset_frac * he,
-                            config.com_offset_frac * he)
     attach_density(prim, density)
-    attach_center_of_mass(prim, com_local, prim_local_scale(prim))
     zero_damping(prim)
     enable_ccd(prim)
 
@@ -460,7 +445,6 @@ def spawn_body(world, rng, config, i, shape, dims, position, color=None, orienta
         "density": density,
         "volume": volume,
         "mass": mass,
-        "com_local_authored": [float(x) for x in com_local],
         "init_position_world": [float(x) for x in position],
         "init_orientation_world": (
             None if orientation is None else [float(x) for x in orientation]

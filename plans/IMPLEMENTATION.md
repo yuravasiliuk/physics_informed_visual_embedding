@@ -192,8 +192,208 @@ unobservable from perfect GT dynamics; the single certified channel (eccroll,
   blend `τ` that re-aims WITHOUT resetting roll) +
   [verify_camera_motion.py](../src/data_gen/verify_camera_motion.py).
   The orbit model could not express pan/tilt/truck at all. **8 motion families
-  are stubs — user is writing them**; `build_camera_paths` does not yet dispatch
-  to `sample_free_path`.
+  are stubs — user is writing them.**
+- ✅ **Cross-model dispatch** — one family namespace over both camera models
+  (`camera_motion.resolve_family` / `sample_any_path`); `build_camera_paths` now
+  routes per rig camera, so a clip can mix models. `handheld`/`gait` exist in
+  both and are a hard error unless prefixed (`subject:gait` / `free:gait`) —
+  resolved at argument-parse time in `collect_corpus`, so a typo costs a second
+  rather than a rollout. Adds `camera_track_tau`. **40/40 checks pass** in
+  `verify_camera_motion.py`, including the fix for a clamped last-frame
+  egomotion (`FreeCameraPath` caches a fixed pose count, so the final frame used
+  to difference against itself and log `v = ω = 0` on 1/T of every dynamic
+  clip — a corrupted label that looked like data, not a crash).
+- ✅ **CoM scrub of `src/data_gen/` (2026-07-28).** The killed CoM target left
+  authoring, knobs, scenarios and a whole driver behind. Removed:
+  `body_factory.attach_center_of_mass` (W2) and the `com_local_authored` spec
+  field; `config.com_offset_frac` / `com_offset_abs_range`; the
+  `--com_offset_abs` / `--com_offset_frac` flags on both drivers. Retired to
+  [src/legacy/](../src/legacy/): `collect_pairs.py` + `pair_scenarios.py` (the
+  twin driver's only intervention was `com`) and `com_scenarios.py`
+  (`build_balance`, `build_eccentric_roll` — both *designed* around the authored
+  offset, so post-removal they would have run and quietly produced geometry-only
+  physics contradicting their own docstrings).
+  **Kept, deliberately:** `read_local_com` and the `com_camera` label — that is
+  the per-body POSITION label, not a CoM-offset target, and it stays a real
+  mass-distribution readout for W5 composites, whose offset *emerges* from the
+  density split and is closed-form checkable (`com_local_analytic`).
+  ⚠ Two consequences: primitive sampling consumes fewer RNG draws, so **old
+  seeds no longer reproduce old scenes** (fine — the corpus is being rebuilt);
+  and new corpora have no `com_local_authored`, which is a hard `KeyError` for
+  `probe/dataset.py` and `probe/density_size_audit.py` and `worldlines/io.py`
+  (all CoM-line analysis; `worldlines/encode.py` already uses `.get`).
+- ✅ **`verify_physics_labels` extended for moving cameras (2026-07-28)** —
+  new `--case moving_camera`, the dynamic-camera label gate
+  ([dynamic-camera.md §7](data-gen/dynamic-camera.md)). Compares camera-frame
+  labels against `get_world_pose` (camera-agnostic), so a residual is a
+  camera/logging fault with no physics component; adds `g_cam` unit-norm +
+  equivariance and egomotion-vs-finite-difference on the logged records, and a
+  **frame-shifted negative control** so the test cannot pass vacuously
+  (measured offline: control 13.5 mm vs a ~1e-16 pass). Dead `offset_com` case
+  removed in the same pass. **First Isaac run: per-frame extrinsics are CORRECT**
+  — position reprojection 1.13e-15 m, control 15.6 mm (10^13x separation), g_cam
+  equivariance 4.4e-16, egomotion vs finite differences exactly 0.
+  It also found a latent flaw in the shared `_quat_angle_between` helper:
+  `2*arccos(|dot|)` on un-normalized quaternions AMPLIFIES float32 noise
+  (arccos(1-eps) ~ sqrt(2*eps)), turning Isaac's ~2e-7 norm deficit into ~9e-4 rad of
+  phantom angle. `case_spin_cuboid` never saw it (0.02 rad tolerance). Replaced
+  with the normalized atan2 half-angle form, `theta = 4*atan2(|qa-qb|, |qa+qb|)` —
+  residual 7e-16 over 2000 random poses, exact on known angles to 179 deg.
+  Payoff beyond the new case: `spin_cuboid`'s orientation-increment check was
+  measuring that ~9e-4 phantom against a 0.02 rad tolerance; its TRUE error is
+  8.4e-7, so that check is now ~1000x more sensitive than it has ever been.
+- 🟡 **Data-gen refactor, steps 1-3 (2026-07-28).** `ClipConfig` had grown to 65
+  fields + 43 module constants, `collect_clip.py` to 808 lines of free functions
+  threading 16 pieces of intermediate state by hand, and the two drivers
+  duplicated **12 of 14 CLI flags** with hand-mirrored override blocks — the same
+  shape of duplication that made the retired `collect_pairs` drift ("mirror the
+  change here manually"). Done **now** deliberately: any refactor can perturb RNG
+  draw order, which is free while the corpus is being rebuilt and expensive once
+  data exists; and it is only safe because the verifier suite now exists to act
+  as the regression net.
+  1. **[cli.py](../src/data_gen/cli.py)** — one table declares each of the 9
+     ClipConfig-override flags once; both drivers consume it. Scope kept narrow:
+     genuinely driver-local args (`--result`, `--seed` vs `--seed_stride`,
+     `--scenario` vs `--scenarios`, `--environment`) stay put. Verified by
+     transcribing both drivers' old override logic and comparing configs over 9
+     arg vectors x 2 drivers — **equivalent on all 18**.
+  2. **`RolloutResult`** — `simulate_clip` returned 2, 3 or 4 values depending on
+     flags, and the arms were mutually exclusive (`collect_raw_pose` took
+     priority and silently discarded camera records). Now one shape, optional
+     products as optional fields. `case_moving_camera` consequently reads the
+     records **the production loop wrote** instead of rebuilding them by hand —
+     it now tests the wiring, not just the logger.
+  3. **[camera_rig.py](../src/data_gen/camera_rig.py)** — see
+     [dynamic-camera.md §6](data-gen/dynamic-camera.md). 737 → 623 lines in
+     collect_clip, 12 → 9 functions, **zero duck-typing branches** left in the
+     capture loop.
+  Offline equivalences established before handing over: **RNG stream position,
+  poses and path parameters identical** across 4 family mixes x 3 seeds (the two
+  phases stay separate — all poses, THEN all paths; interleaving would silently
+  change the corpus for a seed), and **`CameraRig.fixed` reproduces the legacy
+  static basis to 3.3e-16** over 136 poses including the production camera.
+  ⚠ **Steps 1-2 gated 4/4 under Isaac. Step 3 is HALF-gated** — the log pasted
+  first was a re-paste of the step-2 run (identical Kit timestamps), so it said
+  nothing; the real one followed. `collect_clip --scenario collide --seed 0
+  --n_clips 3 --log_contacts` put the **production `CameraRig.solve` through
+  Isaac for the first time**: 20/21 cameras survived (7/6/7 per rollout), and
+  each clip's stored `camera_path` block reconstructs its recorded extrinsics
+  exactly — `R_camera_world` bit-identical, position within 8.9e-16 over all 20
+  clips — so provenance and the pose actually rendered from cannot drift apart.
+  ★ But `camera_path_families` defaults to `("static",)`, so every path was the
+  zero-coefficient case and **the dynamic half is still untested under Isaac**:
+  `_gate_paths` short-circuits on `is_static()`, `pose_for_frame`/`log_frame` are
+  no-ops (0/20 clips wrote `camera.json` — correct for static), and the
+  Replicator child-prim correction is therefore never reached on the production
+  path. Closing that needs a run over `free:dolly_in subject:orbit
+  subject:handheld` with `--camera_roll_always` — both camera models, one
+  translation-dominant and two rotation-dominant (31 deg / 24 deg over the clip),
+  all three with non-degenerate `g_cam.x`.
+  *Caught by grep, worth remembering:* `verify_forward_motion` monkeypatched the
+  free function `collect_clip.build_camera_paths`. When that moved into the rig
+  the patch became a **silent no-op** — it set an attribute nothing read — so the
+  script would have measured a default camera and reported a pass. It now
+  subclasses `CameraRig` and overrides `_sample_path`, a real extension point:
+  gating, annotators and logging stay on the production path.
+  *Second lesson, same shape:* `cli.validate_camera_args` existed so a bad
+  `--camera_families` costs a second, not an Isaac boot — but it only asked
+  whether the name **resolves**, and 8 of the 15 families resolve to a stub.
+  `free:steer` sailed through and raised `NotImplementedError` ~12 s in, from
+  inside `CameraRig.solve`, stage already built. Fixed with
+  `camera_motion.check_family_implemented`, which **probes the real dispatch**
+  with a throwaway RNG rather than consulting a list of implemented families —
+  `sample_motion`'s if-chain stays the only place that knows, so filling in a
+  stub needs no second edit and the two cannot disagree. Rejection now names the
+  available families. Generalizable: *a validator is only worth its name if it
+  asks the question the caller will actually fail on.*
+- 🟡 **`ClipsGenerator` — corpus as a plan (2026-07-29).** A corpus was "one
+  ClipConfig, looped over scenarios", which made the two axes worth controlling
+  invisible: room and egomotion both arrived by *sampling*, so you could not ask
+  for "forward motion in a warehouse" or read yield per condition.
+  [clips_generator.py](../src/data_gen/clips_generator.py) adds `SceneSpec`
+  (room, scenario, `rollout_seed`) × `ViewSpec` (family, speed, roll, tau) over
+  a pure `plan()`, executed by [collect_grid.py](../src/data_gen/collect_grid.py).
+  Owns no generation logic — it builds `ClipConfig`s and calls `collect_clip`,
+  exactly as `collect_corpus` does.
+  - **Purity is the design claim, not a detail.** `plan`/`config_for`/
+    `validate_pure` import no omni, so the driver validates families, rejects
+    duplicate view names and prints the grid **before** `SimulationApp` exists
+    (`--dry_run`). `validate()` (rooms/scenarios) is split out precisely because
+    importing `environments` pre-boot is the documented Kit segfault.
+  - **Twins are structural, and verified two ways.** Camera draws follow all
+    physics draws, and `setup_random_environment(rng, force_name=…)` returns
+    *without consuming a draw* (checked in source) — so one `rollout_seed` is
+    the same physics in every room under every view. Gated at config level:
+    two views of one rollout differ ONLY in camera fields.
+  - **Requested ≠ realized.** `yield_table` reports per cell, because a global
+    rate is what let `collide` lose 5/6 rollouts while the total looked fine.
+    `cost_table` measures first-in-room vs same-room cells — `create_new_stage()`
+    discards the room and `collect_clip` re-references it every cell, so
+    room-major ordering is a **bet on caching below USD composition**, not a
+    structural saving. Measure before believing it.
+  - 39 offline checks in
+    [verify_clips_generator.py](../src/data_gen/verify_clips_generator.py), split
+    pure / orchestration (stubbed omni). ⚠ **No Isaac run yet.**
+  *Three of my own test bugs, one instructive:* the error-containment check
+  raised on a seed whose scenario returned `[]` earlier in the same fixture, so
+  it passed **vacuously**. Two more hardcoded counts that were simply wrong;
+  both now derived from the plan. The code needed no changes.
+- ✅ **`collide` made framable (2026-07-28).** First `--log_contacts` run dropped
+  **5/6 rollouts** as "no viewable camera". Not bad luck — structural: the
+  framing solve clamps at 4 m, capping the framable cloud at **0.93 m radius**,
+  while `min_body_coverage=0.01` needs two ~0.1 m bodies within **~1.3 m** of the
+  camera, where the framable radius is only 0.31 m. Old collide spawned at
+  0.30-0.42 m and spread past 1.6 m by frame 24 even at its slowest draw, giving
+  0.02-0.21% coverage against a 1% bar. Raising the distance clamp cannot fix it
+  (at 8.7 m bodies render ~11 px). Three levers, all landed:
+  1. **Compact the action** — `COLLIDE_HALF_SEP_RANGE (0.30,0.42)→(0.18,0.28)`,
+     `COLLIDE_SPEED_RANGE (1.5,6.0)→(0.6,1.5)`. The mass information is in the
+     Δv **ratio**, not its magnitude, so the high speeds bought nothing.
+  2. **Frame the event, not the sweep** — new `gate_policy` on
+     `preroll_trajectory` + `scenarios.GATE_FRAME_POLICY`. `"event"` gates on the
+     frame of MINIMUM spread (closest approach = impact) and measures the cloud
+     AT that frame; debris leaving afterwards is fine. Default `"max_spread"` is
+     byte-identical to before, so every other scenario is untouched.
+  3. **Bigger bodies** — `COLLIDE_SCALE_RANGE = (0.10, 0.20)`; coverage goes as
+     (size/distance)², so upsizing beats moving the camera closer (which would
+     shrink the framable volume).
+  Measured off-Isaac: **0.02-0.21% → 2.30% coverage** at 0.8-1.6 m framing.
+  **Confirmed under Isaac (2026-07-28):** the same 3-rollout collide run now
+  yields **20/20 clips validated, 20 of 21 cameras surviving** (7/6/7), against
+  5/6 rollouts producing *zero* viewable cameras before. Contacts still fire
+  (368 / 272 events on rollouts 1-2), so the compaction did not trade framing
+  for a dead scenario.
+  ★ Levers 1+3 ALONE are not enough — with the new compact parameters but the old
+  max_spread policy the coverage is still 0.09-0.37% and the camera is still
+  dropped. **The policy was the bug**; the parameters were only making it worse.
+  ⚠ Non-retrofittable (changes dynamics + pixels) — settled before the scale batch.
+- ✅ **Full label suite 4/4 under Isaac (2026-07-28)** — spin_cuboid, two_body,
+  composite, moving_camera. Notably `composite` still passes after the CoM
+  scrub (mass_rel_err 8.4e-9, com_label_err 5.0e-9, com_offset_norm 0.0425 m so
+  the check is not vacuous): keeping `read_local_com` / `com_camera` for W5
+  bodies was the right call, and that is now measured rather than argued.
+- ✅ **Dynamic-camera posing bug — FOUND AND FIXED (2026-07-28).** The first Isaac
+  run of a moving camera rendered *sideways* travel. Cause:
+  `rep.create.camera` builds `Camera_Xform` (what `rep.modify.pose` writes) with
+  a child `Camera` prim carrying a fixed `rotateXYZ=(90,0,90)` frame adapter, and
+  USD composes child-then-parent — so posing with `R_camera_world` renders
+  `R @ C`, a cyclic row permutation. Fix: `replicator_rotation_xyz_deg` sends
+  `C @ R_camera_world`; verified against the live stage
+  ([diagnose_camera_pose.py](../src/data_gen/diagnose_camera_pose.py)) and now
+  gated offline. **Static clips were never affected** (the `look_at` path is
+  correct to 3e-9), so the existing corpus stands.
+  *Lesson, worth generalising:* the offline suite passed 40/40 while the render
+  was wrong, because every check compared our math against our own inverse. Any
+  new engine-facing conversion needs one check that reads state back **from the
+  engine**, not from our model of it.
+- ✅ **Forward-convention gate** — [verify_forward_motion.py](../src/data_gen/verify_forward_motion.py):
+  one deterministic 10 s clip of steady forward motion (hand-written one-term
+  `MotionModel`, no rng, independent of which families are implemented), then
+  eight trajectory checks **plus** the rendered-depth check that is the only
+  thing testing USD's pose convention rather than our own arithmetic. Also
+  extends both CLIs: `collect_clip` had **no camera flags at all** (it could only
+  ever run `static`), and `collect_corpus` had no `--frame_count` — so the
+  single-clip camera test was not runnable by either. **Not yet run under Isaac.**
 - ✅ **Contact logging** — [contact_log.py](../src/data_gen/contact_log.py)
   (`--log_contacts`, opt-in) + the trust gate
   [verify_contacts.py](../src/data_gen/verify_contacts.py) (`J_net ≈ m·Δv −

@@ -40,8 +40,16 @@ from omni.isaac.core import World
 from omni.isaac.core.utils.stage import create_new_stage
 
 from collect_clip import collect_clip          # sets carb asset-root + imports omni at load (SimApp exists now)
-from config import ClipConfig, DEFAULT_DATA_PATH
+from config import DEFAULT_DATA_PATH
+import cli                                      # shared ClipConfig override surface
 import scenarios                                # already imported by collect_clip; here for BUILDERS validation
+
+# The single knob this driver deliberately sets differently from ClipConfig:
+# one camera per rollout ("groups-not-views" — the probe splits on rollouts, not
+# cameras, probe-corpus-spec.md), against ClipConfig's legacy multi-view 7.
+# Every other override falls through to ClipConfig, so there is exactly one
+# source of default truth for them.
+CORPUS_DEFAULTS = {"n_cameras": 1}
 
 DEFAULT_SCENARIOS = ("drop", "roll", "throw", "drop_on_platform", "settle",
                      "push", "cluttered", "topple", "collide")
@@ -88,37 +96,13 @@ def parse_args():
                    help="rollouts (R) per scenario")
     p.add_argument("--scenarios", nargs="+", default=list(DEFAULT_SCENARIOS),
                    help="scenario names to generate (default: all 9)")
-    p.add_argument("--n_cameras", type=int, default=1,
-                   help="cameras per rollout (1 = groups-not-views, the probe default)")
     p.add_argument("--seed_stride", type=int, default=1000,
                    help="seed band width per scenario (seed = scenario_index*stride + rollout)")
-    p.add_argument("--com_offset_abs", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
-                   help="absolute CoM offset range (m); omit for legacy fraction-of-extent")
-    p.add_argument("--depth_format", default="npz", choices=["npz", "ffv1", "hevc12"])
     p.add_argument("--environment", default=None,
                    help="force an environment backdrop; default samples per clip")
-    # --- dynamic camera (dynamic-camera.md) ---------------------------------
-    p.add_argument("--camera_families", nargs="+", default=["static"],
-                   help="camera path families to sample per camera "
-                        "(static orbit arc dolly roll handheld gait). 'static' "
-                        "is the zero-coefficient case = legacy behaviour.")
-    p.add_argument("--camera_weights", nargs="+", type=float, default=None,
-                   help="sampling weights parallel to --camera_families "
-                        "(default uniform)")
-    p.add_argument("--camera_roll_always", action="store_true",
-                   help="force a roll component on every path. REQUIRED for any "
-                        "batch that must carry the gravity-tilt label: only roll "
-                        "breaks g_cam.x==0 — orbit is pure yaw about the gravity "
-                        "axis and dolly is pure translation, and both leave tilt "
-                        "EXACTLY invariant (verify_camera_paths.py).")
-    p.add_argument("--log_contacts", action="store_true",
-                   help="log PhysX contact events (solver-exact impulses at "
-                        "physics rate + the event timestamps that event-anchored "
-                        "targets are built on). REQUIRED for restitution and for "
-                        "mass-ratio-at-collisions — see contact_log.py.")
-    p.add_argument("--camera_path_gate_samples", type=int, default=4,
-                   help="poses probed along each path for visibility gating; "
-                        "1 disables the along-path gate")
+    # Shared ClipConfig overrides (cli.py). `defaults` carries the ONE place
+    # this driver deliberately departs from ClipConfig — see CORPUS_DEFAULTS.
+    cli.add_config_args(p, defaults=CORPUS_DEFAULTS)
     return p.parse_args()
 
 
@@ -128,22 +112,8 @@ def main():
     if bad:
         sys.exit(f"unknown scenarios {bad}; have {sorted(scenarios.BUILDERS)}")
 
-    from camera_paths import FAMILIES as _CAM_FAMILIES
-    bad = [f for f in args.camera_families if f not in _CAM_FAMILIES]
-    if bad:
-        sys.exit(f"unknown camera families {bad}; expected {list(_CAM_FAMILIES)}")
-    if args.camera_weights is not None and len(args.camera_weights) != len(args.camera_families):
-        sys.exit("--camera_weights must be parallel to --camera_families")
-    base_cfg = dataclasses.replace(ClipConfig(), n_cameras=args.n_cameras,
-                                   depth_format=args.depth_format,
-                                   camera_path_families=tuple(args.camera_families),
-                                   camera_path_weights=(tuple(args.camera_weights)
-                                                        if args.camera_weights else None),
-                                   camera_roll_always=args.camera_roll_always,
-                                   camera_path_gate_samples=args.camera_path_gate_samples,
-                                   log_contacts=args.log_contacts)
-    if args.com_offset_abs is not None:
-        base_cfg = dataclasses.replace(base_cfg, com_offset_abs_range=tuple(args.com_offset_abs))
+    cli.validate_camera_args(args)
+    base_cfg = cli.config_from_args(args)
 
     base_out = os.path.abspath(os.path.expanduser(args.result))
     print(f"env={os.environ.get('CONDA_DEFAULT_ENV', '?')} | python={sys.executable}", flush=True)
