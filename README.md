@@ -1,5 +1,9 @@
 # Physics-Informed Visual Embedding
 
+> **Authorship:** this research was conducted by Yura Vasiliuk, an employee of GlobalLogic LLC.
+>
+> **Usage:** all code in this repository may be used for **research purposes only**.
+
 A research codebase building a **domain-agnostic visual encoder** so that downstream
 policies can be trained **entirely in simulation** and deployed on real-world inputs
 without a domain shift. The encoder is the sim→real bridge; physics-grounded
